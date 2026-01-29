@@ -235,7 +235,15 @@ class Trainer:
         # Model config for saving
         self.model_config: Optional[Dict[str, Any]] = None
         if hasattr(model, 'config'):
-            self.model_config = model.config.__dict__ if hasattr(model.config, '__dict__') else None
+            from dataclasses import asdict, is_dataclass
+            if is_dataclass(model.config):
+                cfg_dict = asdict(model.config)
+                # Convert tuple to list for JSON serialization
+                if 'axes_dims_rope' in cfg_dict:
+                    cfg_dict['axes_dims_rope'] = list(cfg_dict['axes_dims_rope'])
+                self.model_config = cfg_dict
+            elif hasattr(model.config, '__dict__'):
+                self.model_config = model.config.__dict__
 
         # Create directories
         os.makedirs(config.checkpoint_dir, exist_ok=True)
