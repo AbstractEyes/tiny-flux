@@ -392,21 +392,25 @@ class Trainer:
             huber_delta=cfg.huber_delta,
         )
 
+        # Extract nested expert info
+        lune_info = expert_info.get('lune') or {}
+        sol_info = expert_info.get('sol') or {}
+
         # Lune distillation
         lune_loss = torch.tensor(0.0, device=self.device)
-        if lune_features is not None and 'lune_pred' in expert_info:
+        if lune_features is not None and 'expert_pred' in lune_info:
             lune_loss = compute_lune_loss(
-                expert_info['lune_pred'],
+                lune_info['expert_pred'],
                 lune_features,
                 mode=cfg.lune_mode,
             )
 
         # Sol distillation
         sol_loss = torch.tensor(0.0, device=self.device)
-        if sol_stats is not None and 'sol_stats_pred' in expert_info:
+        if sol_stats is not None and 'pred_stats' in sol_info:
             sol_loss = compute_sol_loss(
-                expert_info['sol_stats_pred'],
-                expert_info.get('sol_spatial_pred'),
+                sol_info['pred_stats'],
+                sol_info.get('pred_spatial'),
                 sol_stats,
                 sol_spatial,
             )
