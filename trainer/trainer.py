@@ -27,6 +27,8 @@ from typing import Optional, Dict, Any, Tuple, List, Callable
 from dataclasses import dataclass, field
 from tqdm import tqdm
 
+from ..model.model import TinyFluxDeep
+
 from .losses import compute_main_loss, compute_lune_loss, compute_sol_loss, min_snr_weight
 from .schedules import sample_timesteps, flux_shift, get_lune_weight, get_sol_weight, make_cosine_schedule
 from .ema import EMA
@@ -336,7 +338,6 @@ class Trainer:
         v_target = data - noise
 
         # Position IDs
-        from ..model.model import TinyFluxDeep
         img_ids = TinyFluxDeep.create_img_ids(B, H, W, self.device)
 
         # Get expert features from cache
