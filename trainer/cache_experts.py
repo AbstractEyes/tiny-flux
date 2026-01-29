@@ -151,10 +151,12 @@ class EncodingCache:
                     t = t * 2.0 - 1.0
                     img_tensors.append(t)
 
-                img_batch = torch.stack(img_tensors).to(device, dtype=dtype)
+                # Use VAE's dtype for encoding, then cast to storage dtype
+                vae_dtype = next(zoo.vae.parameters()).dtype
+                img_batch = torch.stack(img_tensors).to(device, dtype=vae_dtype)
                 latent = zoo.vae.encode(img_batch).latent_dist.sample()
                 latent = latent * vae_scale
-                all_latents.append(latent.cpu())
+                all_latents.append(latent.cpu().to(dtype))
 
                 # === T5 ===
                 t5_inputs = zoo.t5_tokenizer(
@@ -165,7 +167,7 @@ class EncodingCache:
                     truncation=True,
                 ).to(device)
                 t5_out = zoo.t5(**t5_inputs).last_hidden_state
-                all_t5.append(t5_out.cpu())
+                all_t5.append(t5_out.cpu().to(dtype))
 
                 # === CLIP ===
                 clip_inputs = zoo.clip_tokenizer(
@@ -176,7 +178,7 @@ class EncodingCache:
                     truncation=True,
                 ).to(device)
                 clip_out = zoo.clip(**clip_inputs).pooler_output
-                all_clip.append(clip_out.cpu())
+                all_clip.append(clip_out.cpu().to(dtype))
 
         return cls(
             latents=torch.cat(all_latents, dim=0),
