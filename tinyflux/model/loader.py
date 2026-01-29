@@ -164,6 +164,10 @@ def load_config(
     with open(config_path, 'r') as f:
         config_dict = json.load(f)
 
+    # Convert list to tuple for axes_dims_rope
+    if 'axes_dims_rope' in config_dict and isinstance(config_dict['axes_dims_rope'], list):
+        config_dict['axes_dims_rope'] = tuple(config_dict['axes_dims_rope'])
+
     return TinyFluxConfig(**config_dict)
 
 
