@@ -737,7 +737,7 @@ class MultiSourceCache:
 
             ds_idx = local_indices[mask]
             ds_t = timesteps[mask]
-            features[mask] = cache.lune.get(ds_idx, ds_t)
+            features[mask] = cache.lune.get(ds_idx, ds_t).to(self.dtype)
 
         return features
 
@@ -769,8 +769,8 @@ class MultiSourceCache:
             ds_t = timesteps[mask]
             ds_stats, ds_spatial = cache.sol.get(ds_idx, ds_t)
 
-            stats[mask] = ds_stats
-            spatial[mask] = ds_spatial
+            stats[mask] = ds_stats.to(self.dtype)
+            spatial[mask] = ds_spatial.to(self.dtype)
 
         return stats, spatial
 
