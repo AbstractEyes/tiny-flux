@@ -323,7 +323,7 @@ class LuneFeatureCache:
 
         all_features = torch.zeros(n_prompts, n_buckets, LUNE_DIM, dtype=dtype)
 
-        with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
             for start_idx in tqdm(range(0, n_prompts, batch_size), desc="Extracting Lune"):
                 end_idx = min(start_idx + batch_size, n_prompts)
                 batch_prompts = prompts[start_idx:end_idx]
@@ -499,7 +499,7 @@ class SolFeatureCache:
         spatial_size: int = SOL_SPATIAL_SIZE,
         dtype: torch.dtype = torch.float16,
         base_seed: int = EXTRACTION_BASE_SEED,
-        batch_timesteps: bool = True,
+        batch_timesteps: bool = False,  # Default False - Sol attention is VRAM heavy
     ) -> "SolFeatureCache":
         """
         Extract Sol attention statistics for all prompts at all timestep buckets.
@@ -512,7 +512,7 @@ class SolFeatureCache:
             spatial_size: Spatial output size
             dtype: Storage dtype
             base_seed: Seed for reproducibility
-            batch_timesteps: If True, process all timesteps in one forward (faster, more VRAM)
+            batch_timesteps: If True, process all timesteps in one forward (faster but 10x VRAM)
         """
         device = zoo.device
 
@@ -525,7 +525,7 @@ class SolFeatureCache:
         all_stats = torch.zeros(n_prompts, n_buckets, SOL_STATS_DIM, dtype=dtype)
         all_spatial = torch.zeros(n_prompts, n_buckets, spatial_size, spatial_size, dtype=dtype)
 
-        with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
             for start_idx in tqdm(range(0, n_prompts, batch_size), desc="Extracting Sol"):
                 end_idx = min(start_idx + batch_size, n_prompts)
                 batch_prompts = prompts[start_idx:end_idx]
@@ -697,6 +697,8 @@ class DatasetCache:
         Requires zoo with vae, clip, t5 loaded.
         If build_lune=True, also needs lune loaded.
         If build_sol=True, also needs sol loaded.
+
+        Models are unloaded between steps to manage VRAM.
         """
         print(f"Building cache: {name}")
 
@@ -704,17 +706,35 @@ class DatasetCache:
         print("  [1/3] Encodings...")
         encodings = EncodingCache.build(zoo, images, prompts, batch_size, dtype=dtype)
 
+        # Free VAE/T5 memory - keep CLIP for Lune/Sol
+        zoo.offload("vae")
+        zoo.offload("t5")
+        torch.cuda.empty_cache()
+
         # Lune
         lune = None
         if build_lune:
             print("  [2/3] Lune features...")
-            lune = LuneFeatureCache.build(zoo, prompts, batch_size=batch_size, dtype=dtype)
+            lune = LuneFeatureCache.build(
+                zoo, prompts,
+                batch_size=batch_size,
+                dtype=dtype,
+                batch_timesteps=True,  # Lune is lighter, can batch
+            )
+            # Unload Lune before Sol
+            zoo.unload("lune")
+            torch.cuda.empty_cache()
 
         # Sol
         sol = None
         if build_sol:
             print("  [3/3] Sol features...")
-            sol = SolFeatureCache.build(zoo, prompts, batch_size=batch_size, dtype=dtype)
+            sol = SolFeatureCache.build(
+                zoo, prompts,
+                batch_size=batch_size,
+                dtype=dtype,
+                batch_timesteps=False,  # Sol attention is heavy, don't batch
+            )
 
         print(f"  ✓ Cache complete: {len(encodings)} samples")
         return cls(encodings, lune, sol, name)
