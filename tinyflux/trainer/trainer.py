@@ -78,13 +78,18 @@ class TrainerConfig:
     # Text dropout
     text_dropout: float = 0.0
 
-    # Checkpointing
+    # Checkpointing - Step based
     checkpoint_dir: str = "checkpoints"
-    save_every: int = 5000
-    keep_last_n: int = 3
+    save_every_steps: int = 5000
+    keep_last_n_steps: int = 3
+
+    # Checkpointing - Epoch based
+    save_every_epochs: int = 1  # 0 to disable
+    keep_last_n_epochs: int = 3
 
     # Logging
     log_every: int = 100
+    tensorboard_dir: Optional[str] = None
 
     # Sampling
     sample_every: int = 2000
@@ -93,6 +98,52 @@ class TrainerConfig:
 
     # Mixed precision
     dtype: torch.dtype = torch.bfloat16
+
+    # HuggingFace upload
+    hf_repo_id: Optional[str] = None  # e.g. "AbstractPhil/tinyflux-deep"
+    upload_every_steps: int = 0  # 0 to disable step uploads
+    upload_every_epochs: int = 0  # 0 to disable epoch uploads
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dict for JSON serialization."""
+        d = {}
+        for k, v in self.__dict__.items():
+            if isinstance(v, torch.dtype):
+                d[k] = str(v)
+            elif isinstance(v, tuple):
+                d[k] = list(v)
+            else:
+                d[k] = v
+        return d
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TrainerConfig":
+        """Create from dict."""
+        # Handle dtype conversion
+        if 'dtype' in d and isinstance(d['dtype'], str):
+            dtype_map = {
+                'torch.float32': torch.float32,
+                'torch.float16': torch.float16,
+                'torch.bfloat16': torch.bfloat16,
+            }
+            d['dtype'] = dtype_map.get(d['dtype'], torch.bfloat16)
+        # Handle betas tuple
+        if 'betas' in d and isinstance(d['betas'], list):
+            d['betas'] = tuple(d['betas'])
+        return cls(**d)
+
+    def save(self, path: str):
+        """Save config to JSON."""
+        import json
+        with open(path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "TrainerConfig":
+        """Load config from JSON."""
+        import json
+        with open(path, 'r') as f:
+            return cls.from_dict(json.load(f))
 
 
 def apply_text_dropout(
@@ -122,9 +173,20 @@ class Trainer:
     """
     TinyFlux trainer with Lune/Sol distillation.
 
+    Features:
+        - Step and epoch-based checkpointing
+        - Rolling checkpoint cleanup
+        - TensorBoard logging
+        - HuggingFace upload integration
+        - Resume from checkpoint
+
     Usage:
         trainer = Trainer(model, config)
-        trainer.setup(train_loader, lune_cache, sol_cache)
+        trainer.setup(train_loader, cache)
+        trainer.train()
+
+        # Resume
+        trainer.load_checkpoint("checkpoints/step_5000.pt")
         trainer.train()
     """
 
@@ -165,9 +227,15 @@ class Trainer:
         self.step = 0
         self.epoch = 0
         self.best_loss = float('inf')
+        self.epoch_losses: List[float] = []
 
         # Logging
         self.writer = None
+
+        # Model config for saving
+        self.model_config: Optional[Dict[str, Any]] = None
+        if hasattr(model, 'config'):
+            self.model_config = model.config.__dict__ if hasattr(model.config, '__dict__') else None
 
         # Create directories
         os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -188,15 +256,63 @@ class Trainer:
             train_loader: DataLoader yielding batches
             cache: MultiSourceCache with all precached data
             sampler: Optional Sampler for generating samples during training
-            tensorboard_dir: Optional path for TensorBoard logs
+            tensorboard_dir: Optional path for TensorBoard logs (overrides config)
         """
         self.train_loader = train_loader
         self.cache = cache
         self.sampler = sampler
 
-        if tensorboard_dir:
+        # TensorBoard
+        tb_dir = tensorboard_dir or self.config.tensorboard_dir
+        if tb_dir:
             from torch.utils.tensorboard import SummaryWriter
-            self.writer = SummaryWriter(tensorboard_dir)
+            os.makedirs(tb_dir, exist_ok=True)
+            self.writer = SummaryWriter(tb_dir)
+
+        # Save configs
+        self._save_configs()
+
+    def _save_configs(self):
+        """Save training and model configs to checkpoint directory."""
+        import json
+        cfg = self.config
+
+        # Training config
+        trainer_config_path = os.path.join(cfg.checkpoint_dir, "training_config.json")
+        cfg.save(trainer_config_path)
+
+        # Model config
+        if self.model_config:
+            model_config_path = os.path.join(cfg.checkpoint_dir, "config.json")
+            with open(model_config_path, 'w') as f:
+                json.dump(self.model_config, f, indent=2)
+
+    def _log_step(self, losses: Dict[str, float], lr: float, grad_norm: Optional[float] = None):
+        """Log metrics to TensorBoard."""
+        if self.writer is None:
+            return
+
+        # Losses
+        for name, value in losses.items():
+            self.writer.add_scalar(f'loss/{name}', value, self.step)
+
+        # Learning rate
+        self.writer.add_scalar('train/lr', lr, self.step)
+
+        # Gradient norm
+        if grad_norm is not None:
+            self.writer.add_scalar('train/grad_norm', grad_norm, self.step)
+
+        # Step/epoch
+        self.writer.add_scalar('train/epoch', self.epoch, self.step)
+
+    def _log_epoch(self, epoch_loss: float):
+        """Log epoch-level metrics."""
+        if self.writer is None:
+            return
+
+        self.writer.add_scalar('epoch/loss', epoch_loss, self.epoch)
+        self.writer.add_scalar('epoch/step', self.step, self.epoch)
 
     def train(self):
         """Main training loop."""
@@ -253,19 +369,28 @@ class Trainer:
                 self.step += 1
 
                 # Logging
-                if self.step % cfg.log_every == 0 and self.writer:
-                    self.writer.add_scalar('train/loss', losses['total'], self.step)
-                    self.writer.add_scalar('train/main_loss', losses['main'], self.step)
-                    self.writer.add_scalar('train/lune_loss', losses['lune'], self.step)
-                    self.writer.add_scalar('train/sol_loss', losses['sol'], self.step)
-                    self.writer.add_scalar('train/lr', self.scheduler.get_last_lr()[0], self.step)
-                    self.writer.add_scalar('train/grad_norm', grad_norm.item(), self.step)
-                    self.writer.add_scalar('train/lune_weight', losses['lune_w'], self.step)
-                    self.writer.add_scalar('train/sol_weight', losses['sol_w'], self.step)
+                if self.step % cfg.log_every == 0:
+                    lr = self.scheduler.get_last_lr()[0]
+                    self._log_step(
+                        {
+                            'total': losses['total'],
+                            'main': losses['main'],
+                            'lune': losses['lune'],
+                            'sol': losses['sol'],
+                            'lune_weight': losses['lune_w'],
+                            'sol_weight': losses['sol_w'],
+                        },
+                        lr=lr,
+                        grad_norm=grad_norm.item(),
+                    )
 
-                # Checkpointing
-                if self.step % cfg.save_every == 0:
-                    self._save_checkpoint()
+                # Step-based checkpointing
+                if cfg.save_every_steps > 0 and self.step % cfg.save_every_steps == 0:
+                    path = self._save_checkpoint()
+
+                    # HF upload at step intervals
+                    if cfg.upload_every_steps > 0 and self.step % cfg.upload_every_steps == 0:
+                        self.upload_checkpoint(path)
 
                 # Sampling
                 if cfg.sample_prompts and self.step % cfg.sample_every == 0:
@@ -294,12 +419,25 @@ class Trainer:
         # Epoch summary
         n = max(ep_batches, 1)
         avg_loss = ep_loss / n
+        self.epoch_losses.append(avg_loss)
         print(f"\nEpoch {self.epoch}: loss={avg_loss:.4f}, main={ep_main/n:.4f}, "
               f"lune={ep_lune/n:.4f}, sol={ep_sol/n:.4f}")
 
+        # Log epoch metrics
+        self._log_epoch(avg_loss)
+
+        # Best checkpoint
         if avg_loss < self.best_loss:
             self.best_loss = avg_loss
             self._save_checkpoint(best=True)
+
+        # Epoch-based checkpointing
+        if cfg.save_every_epochs > 0 and self.epoch % cfg.save_every_epochs == 0:
+            path = self._save_checkpoint(epoch_checkpoint=True)
+
+            # HF upload at epoch intervals
+            if cfg.upload_every_epochs > 0 and self.epoch % cfg.upload_every_epochs == 0:
+                self.upload_checkpoint(path)
 
     def _train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Single training step."""
@@ -433,8 +571,20 @@ class Trainer:
             'sol_w': sol_w,
         }
 
-    def _save_checkpoint(self, best: bool = False, final: bool = False):
-        """Save checkpoint."""
+    def _save_checkpoint(
+        self,
+        best: bool = False,
+        final: bool = False,
+        epoch_checkpoint: bool = False,
+    ):
+        """
+        Save checkpoint.
+
+        Args:
+            best: Save as best.pt
+            final: Save as final.pt
+            epoch_checkpoint: Save as epoch_N.pt (vs step_N.pt)
+        """
         cfg = self.config
 
         # Get model state (handle compiled)
@@ -451,14 +601,17 @@ class Trainer:
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'ema': self.ema.state_dict(),
-            'config': cfg,
+            'trainer_config': cfg.to_dict(),
+            'model_config': self.model_config,
         }
 
-        # Determine path
+        # Determine name
         if final:
             name = 'final'
         elif best:
             name = 'best'
+        elif epoch_checkpoint:
+            name = f'epoch_{self.epoch}'
         else:
             name = f'step_{self.step}'
 
@@ -467,35 +620,133 @@ class Trainer:
 
         # Save EMA weights as safetensors
         ema_path = os.path.join(cfg.checkpoint_dir, f'{name}_ema.safetensors')
-        try:
-            from safetensors.torch import save_file
-            save_file(self.ema.shadow, ema_path)
-        except ImportError:
-            pass
+        self.ema.save(ema_path)
 
         print(f"  ✓ Saved: {path}")
 
-        # Cleanup old
-        if not best and not final:
-            self._cleanup_checkpoints()
+        # Cleanup old checkpoints
+        if epoch_checkpoint:
+            self._cleanup_checkpoints(epoch_based=True)
+        elif not best and not final:
+            self._cleanup_checkpoints(epoch_based=False)
 
-    def _cleanup_checkpoints(self):
-        """Keep only last N checkpoints."""
+        return path
+
+    def _cleanup_checkpoints(self, epoch_based: bool = False):
+        """
+        Keep only last N checkpoints.
+
+        Args:
+            epoch_based: Clean epoch_* checkpoints (vs step_*)
+        """
         cfg = self.config
 
+        if epoch_based:
+            prefix = 'epoch_'
+            keep_n = cfg.keep_last_n_epochs
+        else:
+            prefix = 'step_'
+            keep_n = cfg.keep_last_n_steps
+
+        # Find matching checkpoints
         checkpoints = sorted([
             f for f in os.listdir(cfg.checkpoint_dir)
-            if f.startswith('step_') and f.endswith('.pt')
+            if f.startswith(prefix) and f.endswith('.pt')
         ], key=lambda x: int(x.split('_')[1].split('.')[0]))
 
-        while len(checkpoints) > cfg.keep_last_n:
+        # Remove excess
+        while len(checkpoints) > keep_n:
             old = checkpoints.pop(0)
             old_path = os.path.join(cfg.checkpoint_dir, old)
             os.remove(old_path)
+
             # Also EMA
             ema_path = old_path.replace('.pt', '_ema.safetensors')
             if os.path.exists(ema_path):
                 os.remove(ema_path)
+
+    def _upload_to_hf(self, files: Optional[List[str]] = None, commit_message: Optional[str] = None):
+        """
+        Upload files to HuggingFace.
+
+        Args:
+            files: List of file paths to upload (or upload whole checkpoint_dir)
+            commit_message: Commit message
+        """
+        cfg = self.config
+
+        if not cfg.hf_repo_id:
+            return
+
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+
+            if files:
+                for file_path in files:
+                    if os.path.exists(file_path):
+                        api.upload_file(
+                            path_or_fileobj=file_path,
+                            path_in_repo=os.path.basename(file_path),
+                            repo_id=cfg.hf_repo_id,
+                            commit_message=commit_message or f"Upload {os.path.basename(file_path)}",
+                        )
+            else:
+                # Upload entire checkpoint directory
+                api.upload_folder(
+                    folder_path=cfg.checkpoint_dir,
+                    repo_id=cfg.hf_repo_id,
+                    commit_message=commit_message or f"Training step {self.step}",
+                )
+
+            print(f"  ✓ Uploaded to {cfg.hf_repo_id}")
+        except Exception as e:
+            print(f"  ✗ HF upload failed: {e}")
+
+    def upload_checkpoint(self, checkpoint_path: str):
+        """Upload a specific checkpoint to HuggingFace."""
+        cfg = self.config
+
+        if not cfg.hf_repo_id:
+            print("  ✗ No hf_repo_id configured")
+            return
+
+        files = [checkpoint_path]
+
+        # Also upload EMA
+        ema_path = checkpoint_path.replace('.pt', '_ema.safetensors')
+        if os.path.exists(ema_path):
+            files.append(ema_path)
+
+        # Also upload configs
+        config_files = ['config.json', 'training_config.json']
+        for cf in config_files:
+            cf_path = os.path.join(cfg.checkpoint_dir, cf)
+            if os.path.exists(cf_path):
+                files.append(cf_path)
+
+        self._upload_to_hf(files, f"Checkpoint step {self.step}")
+
+    def upload_samples(self):
+        """Upload samples directory to HuggingFace."""
+        cfg = self.config
+
+        if not cfg.hf_repo_id or not os.path.exists(cfg.sample_dir):
+            return
+
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+
+            api.upload_folder(
+                folder_path=cfg.sample_dir,
+                path_in_repo="samples",
+                repo_id=cfg.hf_repo_id,
+                commit_message=f"Samples at step {self.step}",
+            )
+            print(f"  ✓ Uploaded samples to {cfg.hf_repo_id}")
+        except Exception as e:
+            print(f"  ✗ Sample upload failed: {e}")
 
     def _generate_samples(self):
         """Generate samples during training."""

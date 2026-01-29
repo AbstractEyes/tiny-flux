@@ -95,7 +95,6 @@ class EMA:
 
     class _EMAContext:
         """Context manager for temporary EMA weight application."""
-
         def __init__(self, ema: "EMA", model: nn.Module):
             self.ema = ema
             self.model = model
@@ -143,9 +142,9 @@ class EMA:
         self.decay = state.get('decay', self.decay)
 
     def load_shadow(
-            self,
-            shadow_state: Dict[str, torch.Tensor],
-            model: Optional[nn.Module] = None,
+        self,
+        shadow_state: Dict[str, torch.Tensor],
+        model: Optional[nn.Module] = None,
     ) -> Dict[str, int]:
         """
         Load shadow weights from a checkpoint, handling missing/extra keys.
@@ -190,6 +189,36 @@ class EMA:
         for k in self.shadow:
             self.shadow[k] = self.shadow[k].to(device)
         return self
+
+    def copy_to(self, model: nn.Module):
+        """Copy EMA shadow weights to model (for deployment)."""
+        self._load_state_dict(model, self.shadow)
+
+    def save(self, path: str):
+        """
+        Save EMA shadow weights to file.
+
+        Supports .safetensors and .pt formats.
+        """
+        if path.endswith('.safetensors'):
+            from safetensors.torch import save_file
+            save_file(self.shadow, path)
+        else:
+            torch.save(self.shadow, path)
+
+    def load(self, path: str, device: str = 'cpu'):
+        """
+        Load EMA shadow weights from file.
+
+        Args:
+            path: .safetensors or .pt file
+            device: Target device
+        """
+        if path.endswith('.safetensors'):
+            from safetensors.torch import load_file
+            self.shadow = load_file(path, device=device)
+        else:
+            self.shadow = torch.load(path, map_location=device)
 
     def __repr__(self) -> str:
         n_params = sum(v.numel() for v in self.shadow.values())

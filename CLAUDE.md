@@ -21,17 +21,20 @@ TinyFluxDeep (240M)
 ```
 tinyflux/
 ├── model/
-│   ├── model.py      # TinyFluxConfig, TinyFluxDeep
-│   └── zoo.py        # ModelZoo (load/unload models), SolAttnProcessor
+│   ├── model.py          # TinyFluxConfig, TinyFluxDeep
+│   ├── zoo.py            # ModelZoo (extraction models only)
+│   └── loader.py         # Unified model loading
 ├── trainer/
 │   ├── cache_experts.py  # EncodingCache, LuneFeatureCache, SolFeatureCache, DatasetCache, MultiSourceCache
+│   ├── data.py           # CachedDataset, MultiCachedDataset, collate_fn
 │   ├── trainer.py        # Trainer, TrainerConfig
 │   ├── losses.py         # main_loss, lune_loss, sol_loss, min_snr
 │   ├── schedules.py      # flux_shift, timestep sampling, warmup
 │   ├── ema.py            # EMA
 │   └── sampling.py       # CFG sampling, Sampler class
-└── util/
-    └── predictions.py # Rectified flow math
+├── util/
+│   └── predictions.py    # Rectified flow math
+└── test_training.py      # Field test script for Colab
 ```
 
 ## Training Workflow
@@ -193,25 +196,29 @@ No experts needed at inference - Lune/Sol predictors learned the behavior.
 | File | Purpose |
 |------|---------|
 | `model.py` | TinyFluxDeep architecture, attention blocks, RoPE |
-| `zoo.py` | Load/unload VAE, CLIP, T5, Lune, Sol; SolAttnProcessor for attention capture |
+| `zoo.py` | Load VAE, CLIP, T5, Lune, Sol for extraction; SolAttnProcessor |
+| `loader.py` | Unified model loading from HF/file/directory |
 | `cache_experts.py` | EncodingCache, LuneFeatureCache, SolFeatureCache, DatasetCache, MultiSourceCache |
-| `trainer.py` | Training loop, optimizer, EMA, checkpointing |
+| `data.py` | CachedDataset, MultiCachedDataset, collate_fn (bridges cache to DataLoader) |
+| `trainer.py` | Training loop, optimizer, EMA, checkpointing, HF upload |
 | `losses.py` | `compute_main_loss`, `compute_lune_loss`, `compute_sol_loss`, `min_snr_weight` |
 | `schedules.py` | `flux_shift`, `sample_timesteps`, warmup functions |
+| `ema.py` | EMA with save/load/copy_to |
 | `sampling.py` | CFG sampling with flux shift |
 | `predictions.py` | Rectified flow math |
+| `test_training.py` | Field test for Colab - verifies full pipeline |
 
 ## Batch Format
 
-DataLoader must yield:
+`collate_fn` from `data.py` produces:
 ```python
 {
     'latents': [B, 16, 64, 64],      # VAE-encoded images
     't5_embeds': [B, 128, 768],      # T5 hidden states
     'clip_pooled': [B, 768],         # CLIP pooled
-    'local_indices': [B],            # Index into cache
-    'dataset_ids': [B],              # Which dataset (for multi-source)
-    'masks': [B, 64, 64] or None,    # Optional foreground mask
+    'local_indices': [B],            # Index into cache (for expert lookup)
+    'dataset_ids': [B],              # Which dataset (for multi-source routing)
+    'masks': None,                   # Not currently cached
 }
 ```
 
@@ -243,13 +250,68 @@ TrainerConfig(
     ema_decay=0.9999,
     shift=3.0,                    # Flux shift
     use_snr_weighting=True,
+    
+    # Expert distillation
     enable_lune=True,
     lune_weight=0.1,
     lune_warmup_steps=1000,
-    lune_dropout=0.1,             # Drop teacher features sometimes
-    lune_mode="cosine",
+    lune_dropout=0.1,
     enable_sol=True,
     sol_weight=0.05,
     sol_warmup_steps=2000,
+    
+    # Checkpointing
+    save_every_steps=5000,        # Step-based checkpoints
+    keep_last_n_steps=3,          # Rolling cleanup
+    save_every_epochs=1,          # Epoch-based checkpoints
+    keep_last_n_epochs=3,
+    
+    # Logging
+    tensorboard_dir="logs",       # TensorBoard output
+    log_every=100,
+    
+    # HuggingFace upload
+    hf_repo_id="user/model",      # Optional HF repo
+    upload_every_steps=0,         # 0 to disable
+    upload_every_epochs=1,        # Upload after each epoch
 )
 ```
+
+## Loading Models
+
+```python
+from tinyflux.model.loader import load_model, load_checkpoint, from_pretrained
+
+# From HuggingFace
+model = from_pretrained("AbstractPhil/tinyflux-deep", use_ema=True)
+
+# From local file
+model = load_model("/path/to/model.safetensors")
+
+# From directory
+model = load_model("/path/to/checkpoint/")
+
+# Resume training
+ckpt = load_checkpoint("checkpoints/step_5000.pt")
+model = ckpt['model']
+step = ckpt['step']
+```
+
+## Field Testing
+
+Run on Colab to verify full pipeline:
+
+```bash
+!git clone https://github.com/AbstractPhil/tinyflux
+%cd tinyflux
+!pip install -e .
+!python test_training.py
+```
+
+Test script:
+1. Generates random images + prompts
+2. Builds all caches (VAE, T5, CLIP, Lune, Sol)
+3. Trains TinyFlux for 50 steps
+4. Verifies losses decrease
+
+Passes if final loss < 1.0.

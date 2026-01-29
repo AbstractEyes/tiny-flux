@@ -31,8 +31,15 @@ class ModelZoo:
         zoo.load_vae()
         zoo.load_clip()
         zoo.load_t5()
-        zoo.load_tinyflux("path/to/checkpoint.safetensors")
         zoo.load_lune()
+        zoo.load_sol()
+
+        # Load TinyFlux from various sources
+        zoo.load_tinyflux("AbstractPhil/tinyflux-deep")  # HF repo
+        zoo.load_tinyflux("/path/to/checkpoint/")        # Directory
+        zoo.load_tinyflux("/path/to/model.safetensors")  # File
+        zoo.load_tinyflux(None, train_mode=True)         # Random init for training
+        zoo.load_tinyflux("repo/model", load_ema=True)   # Load EMA weights
 
         # Access models
         latent = zoo.vae.encode(image).latent_dist.sample()
@@ -204,33 +211,51 @@ class ModelZoo:
 
     def load_tinyflux(
         self,
-        checkpoint_path: Optional[str] = None,
+        source: Optional[str] = None,
         config: Optional["TinyFluxConfig"] = None,
         dtype: Optional[torch.dtype] = None,
         compile_model: bool = False,
         train_mode: bool = False,
+        load_ema: bool = False,
+        ema_path: Optional[str] = None,
     ) -> nn.Module:
         """
         Load TinyFlux model.
 
         Args:
-            checkpoint_path: Path to .safetensors weights (None for random init)
-            config: Model config (uses defaults if None)
+            source: One of:
+                - HF repo: "AbstractPhil/tinyflux-deep"
+                - Local directory: "/path/to/checkpoint/"
+                - Local file: "/path/to/model.safetensors"
+                - None for random initialization
+            config: Model config (loaded from source or uses defaults if None)
             dtype: Model dtype
             compile_model: Whether to torch.compile
             train_mode: If True, keeps requires_grad=True
+            load_ema: If True, load EMA weights instead of model weights
+            ema_path: Explicit path to EMA weights
         """
         from .model import TinyFluxConfig, TinyFluxDeep
-        from safetensors.torch import load_file
+        from .loader import load_model
 
         dtype = dtype or self.dtype
-        cfg = config or TinyFluxConfig()
 
-        model = TinyFluxDeep(cfg).to(dtype).to(self.device)
-
-        if checkpoint_path:
-            state_dict = load_file(checkpoint_path)
-            model.load_state_dict(state_dict, strict=False)
+        if source:
+            # Use unified loader
+            model = load_model(
+                source,
+                config=config,
+                device=self.device,
+                dtype=dtype,
+                load_ema=load_ema,
+                ema_path=ema_path,
+                compile_model=False,  # Compile after if needed
+                strict=False,
+            )
+        else:
+            # Random init
+            cfg = config or TinyFluxConfig()
+            model = TinyFluxDeep(cfg).to(dtype).to(self.device)
 
         if not train_mode:
             model.eval()
@@ -254,7 +279,7 @@ class ModelZoo:
         repo_id: str = "AbstractPhil/tinyflux-experts",
         filename: str = "sd15-flow-lune-unet.safetensors",
         dtype: Optional[torch.dtype] = None,
-        compile_model: bool = False,
+        compile_model: bool = True,
     ) -> nn.Module:
         """
         Load Lune (SD1.5 UNet with flow-matching weights).

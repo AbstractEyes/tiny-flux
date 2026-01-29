@@ -299,11 +299,19 @@ class LuneFeatureCache:
         batch_size: int = 64,
         dtype: torch.dtype = torch.float16,
         base_seed: int = EXTRACTION_BASE_SEED,
+        batch_timesteps: bool = True,
     ) -> "LuneFeatureCache":
         """
         Extract Lune mid-block features for all prompts at all timestep buckets.
 
-        Requires zoo with clip and lune loaded.
+        Args:
+            zoo: ModelZoo with clip and lune loaded
+            prompts: List of prompts
+            t_buckets: Timestep buckets (default: 10 from 0.05 to 0.95)
+            batch_size: Prompts per batch
+            dtype: Storage dtype
+            base_seed: Seed for reproducibility
+            batch_timesteps: If True, process all timesteps in one forward (faster, more VRAM)
         """
         device = zoo.device
 
@@ -330,32 +338,58 @@ class LuneFeatureCache:
                     truncation=True,
                 ).to(device)
                 clip_out = zoo.clip(**clip_inputs)
-                clip_hidden = clip_out.last_hidden_state
+                clip_hidden = clip_out.last_hidden_state  # [B, 77, 768]
 
-                # Process each timestep bucket
-                for t_idx, t_val in enumerate(t_buckets):
-                    t = torch.full((B,), t_val.item(), device=device)
+                if batch_timesteps:
+                    # === Batched: All timesteps in one forward ===
+                    # Expand clip_hidden: [B, 77, 768] -> [B*n_buckets, 77, 768]
+                    clip_expanded = clip_hidden.unsqueeze(1).expand(-1, n_buckets, -1, -1)
+                    clip_expanded = clip_expanded.reshape(B * n_buckets, 77, -1)
 
-                    # Seeded random latents for reproducibility
-                    gen = seed_batch_extraction(start_idx, B, t_idx, device, base_seed)
+                    # Create timesteps: [B*n_buckets]
+                    t_all = t_buckets.unsqueeze(0).expand(B, -1).reshape(-1)
+
+                    # Seeded latents for all timesteps
+                    gen = seed_batch_extraction(start_idx, B * n_buckets, 0, device, base_seed)
                     latents = torch.randn(
-                        B, 4, 64, 64,
+                        B * n_buckets, 4, 64, 64,
                         generator=gen,
                         device=device,
                         dtype=torch.float16,
                     )
 
-                    # Forward through Lune - hook captures mid-block
-                    t_scaled = t * 1000
-                    _ = zoo.lune(latents, t_scaled, encoder_hidden_states=clip_hidden)
+                    # Single forward
+                    t_scaled = t_all * 1000
+                    _ = zoo.lune(latents, t_scaled, encoder_hidden_states=clip_expanded)
 
-                    # Get captured features
                     mid_features = zoo.lune_mid_features
                     if mid_features is not None:
-                        # Pool spatial: [B, 1280, H, W] -> [B, 1280]
                         if mid_features.dim() == 4:
-                            mid_features = mid_features.mean(dim=[2, 3])
-                        all_features[start_idx:end_idx, t_idx] = mid_features.cpu().to(dtype)
+                            mid_features = mid_features.mean(dim=[2, 3])  # [B*n_buckets, 1280]
+                        # Reshape back: [B*n_buckets, 1280] -> [B, n_buckets, 1280]
+                        mid_features = mid_features.view(B, n_buckets, -1)
+                        all_features[start_idx:end_idx] = mid_features.cpu().to(dtype)
+                else:
+                    # === Sequential: One timestep at a time ===
+                    for t_idx, t_val in enumerate(t_buckets):
+                        t = torch.full((B,), t_val.item(), device=device)
+
+                        gen = seed_batch_extraction(start_idx, B, t_idx, device, base_seed)
+                        latents = torch.randn(
+                            B, 4, 64, 64,
+                            generator=gen,
+                            device=device,
+                            dtype=torch.float16,
+                        )
+
+                        t_scaled = t * 1000
+                        _ = zoo.lune(latents, t_scaled, encoder_hidden_states=clip_hidden)
+
+                        mid_features = zoo.lune_mid_features
+                        if mid_features is not None:
+                            if mid_features.dim() == 4:
+                                mid_features = mid_features.mean(dim=[2, 3])
+                            all_features[start_idx:end_idx, t_idx] = mid_features.cpu().to(dtype)
 
         return cls(all_features, t_buckets.cpu(), dtype)
 
@@ -465,11 +499,20 @@ class SolFeatureCache:
         spatial_size: int = SOL_SPATIAL_SIZE,
         dtype: torch.dtype = torch.float16,
         base_seed: int = EXTRACTION_BASE_SEED,
+        batch_timesteps: bool = True,
     ) -> "SolFeatureCache":
         """
         Extract Sol attention statistics for all prompts at all timestep buckets.
 
-        Requires zoo with clip and sol loaded.
+        Args:
+            zoo: ModelZoo with clip and sol loaded
+            prompts: List of prompts
+            t_buckets: Timestep buckets
+            batch_size: Prompts per batch
+            spatial_size: Spatial output size
+            dtype: Storage dtype
+            base_seed: Seed for reproducibility
+            batch_timesteps: If True, process all timesteps in one forward (faster, more VRAM)
         """
         device = zoo.device
 
@@ -496,26 +539,52 @@ class SolFeatureCache:
                     max_length=77,
                     truncation=True,
                 ).to(device)
-                clip_hidden = zoo.clip(**clip_inputs).last_hidden_state
+                clip_hidden = zoo.clip(**clip_inputs).last_hidden_state  # [B, 77, 768]
 
-                # Process each timestep bucket
-                for t_idx, t_val in enumerate(t_buckets):
-                    t = torch.full((B,), t_val.item(), device=device)
+                if batch_timesteps:
+                    # === Batched: All timesteps in one forward ===
+                    # Expand clip_hidden: [B, 77, 768] -> [B*n_buckets, 77, 768]
+                    clip_expanded = clip_hidden.unsqueeze(1).expand(-1, n_buckets, -1, -1)
+                    clip_expanded = clip_expanded.reshape(B * n_buckets, 77, -1).half()
 
-                    # Seeded random latents
-                    gen = seed_batch_extraction(start_idx, B, t_idx, device, base_seed)
+                    # Create timesteps: [B*n_buckets]
+                    t_all = t_buckets.unsqueeze(0).expand(B, -1).reshape(-1)
+
+                    # Seeded latents
+                    gen = seed_batch_extraction(start_idx, B * n_buckets, 0, device, base_seed)
                     latents = torch.randn(
-                        B, 4, 64, 64,
+                        B * n_buckets, 4, 64, 64,
                         generator=gen,
                         device=device,
                         dtype=torch.float16,
                     )
 
-                    # Extract attention statistics
-                    stats, spatial = zoo.sol_forward(latents, t, clip_hidden.half(), spatial_size)
+                    # Single forward
+                    stats, spatial = zoo.sol_forward(latents, t_all, clip_expanded, spatial_size)
 
-                    all_stats[start_idx:end_idx, t_idx] = stats.cpu().to(dtype)
-                    all_spatial[start_idx:end_idx, t_idx] = spatial.cpu().to(dtype)
+                    # Reshape: [B*n_buckets, ...] -> [B, n_buckets, ...]
+                    stats = stats.view(B, n_buckets, -1)
+                    spatial = spatial.view(B, n_buckets, spatial_size, spatial_size)
+
+                    all_stats[start_idx:end_idx] = stats.cpu().to(dtype)
+                    all_spatial[start_idx:end_idx] = spatial.cpu().to(dtype)
+                else:
+                    # === Sequential: One timestep at a time ===
+                    for t_idx, t_val in enumerate(t_buckets):
+                        t = torch.full((B,), t_val.item(), device=device)
+
+                        gen = seed_batch_extraction(start_idx, B, t_idx, device, base_seed)
+                        latents = torch.randn(
+                            B, 4, 64, 64,
+                            generator=gen,
+                            device=device,
+                            dtype=torch.float16,
+                        )
+
+                        stats, spatial = zoo.sol_forward(latents, t, clip_hidden.half(), spatial_size)
+
+                        all_stats[start_idx:end_idx, t_idx] = stats.cpu().to(dtype)
+                        all_spatial[start_idx:end_idx, t_idx] = spatial.cpu().to(dtype)
 
         return cls(all_stats, all_spatial, t_buckets.cpu(), dtype)
 
