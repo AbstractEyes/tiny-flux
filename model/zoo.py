@@ -251,7 +251,7 @@ class ModelZoo:
     def load_lune(
         self,
         weights_path: Optional[str] = None,
-        repo_id: str = "AbstractPhil/sd15-experts",
+        repo_id: str = "AbstractPhil/tinyflux-experts",
         filename: str = "sd15-flow-lune-unet.safetensors",
         dtype: Optional[torch.dtype] = None,
         compile_model: bool = True,
@@ -313,7 +313,7 @@ class ModelZoo:
     def load_sol(
         self,
         weights_path: Optional[str] = None,
-        repo_id: str = "AbstractPhil/sd15-experts",
+        repo_id: str = "AbstractPhil/tinyflux-experts",
         filename: str = "sd15-flow-sol-unet.safetensors",
         dtype: Optional[torch.dtype] = None,
         compile_model: bool = False,
