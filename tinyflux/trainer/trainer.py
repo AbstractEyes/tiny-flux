@@ -678,10 +678,40 @@ class Trainer:
         lune_w = get_lune_weight(self.step, cfg.lune_warmup_steps, cfg.lune_weight)
         sol_w = get_sol_weight(self.step, cfg.sol_warmup_steps, cfg.sol_weight)
 
+        # Debug: print on first step
+        if not hasattr(self, '_sol_debug'):
+            print(f"\n  [DEBUG] step={self.step}")
+            print(f"  [DEBUG] sol_w={sol_w:.6f}, lune_w={lune_w:.6f}")
+            print(f"  [DEBUG] sol_loss={sol_loss.item():.4f} (before weighting)")
+            if self.model.sol_prior is not None:
+                sol_params = list(self.model.sol_prior.parameters())
+                sol_req = sum(p.requires_grad for p in sol_params)
+                sol_total = len(sol_params)
+                print(f"  [DEBUG] sol_prior: {sol_req}/{sol_total} params require_grad")
+                # Check optimizer
+                opt_params = sum(len(g['params']) for g in self.optimizer.param_groups)
+                print(f"  [DEBUG] optimizer has {opt_params} params")
+            self._sol_debug = True
+
         total_loss = main_loss + lune_w * lune_loss + sol_w * sol_loss
 
         # Backward (scaled for gradient accumulation)
         (total_loss / cfg.gradient_accumulation).backward()
+
+        # Debug: check gradient flow on first backward
+        if not hasattr(self, '_grad_debug'):
+            if self.model.sol_prior is not None:
+                sol_grads = []
+                for name, p in self.model.sol_prior.named_parameters():
+                    if p.grad is not None:
+                        sol_grads.append((name, p.grad.abs().mean().item()))
+                if sol_grads:
+                    print(f"  [DEBUG] sol_prior gradients: {len(sol_grads)} params have grads")
+                    for name, g in sol_grads[:3]:
+                        print(f"    {name}: grad_mean={g:.6f}")
+                else:
+                    print(f"  [DEBUG] sol_prior: NO GRADIENTS!")
+            self._grad_debug = True
 
         return {
             'total': total_loss.item(),
