@@ -31,7 +31,7 @@ from .losses import compute_main_loss, compute_lune_loss, compute_sol_loss, min_
 from .schedules import sample_timesteps, get_lune_weight, get_sol_weight, make_cosine_schedule
 from .ema import EMA
 from .cache_experts import MultiSourceCache
-from tinyflux.utils.predictions import flow_x_t, flow_velocity
+from tinyflux.util.predictions import flow_x_t, flow_velocity
 
 
 @dataclass
@@ -48,6 +48,7 @@ class TrainerConfig:
     # Schedule
     warmup_steps: int = 1000
     total_steps: int = 100000
+    max_epochs: Optional[int] = None  # None = unlimited, stops at total_steps
     lr_scheduler: str = "cosine"  # "cosine", "linear", "constant"
     min_lr: float = 0.0  # Minimum LR for cosine decay
     warmup_type: str = "linear"  # "linear", "cosine"
@@ -412,19 +413,14 @@ class Trainer:
         self.writer.add_scalar('epoch/loss', epoch_loss, self.epoch)
         self.writer.add_scalar('epoch/step', self.step, self.epoch)
 
-    def train(self, max_epochs: Optional[int] = None):
-        """
-        Main training loop.
-
-        Args:
-            max_epochs: If set, stop after this many epochs (otherwise runs to total_steps)
-        """
+    def train(self):
+        """Main training loop. Runs until total_steps or max_epochs (whichever first)."""
         cfg = self.config
 
         print(f"\nStarting training:")
         print(f"  Total steps: {cfg.total_steps}")
-        if max_epochs:
-            print(f"  Max epochs: {max_epochs}")
+        if cfg.max_epochs:
+            print(f"  Max epochs: {cfg.max_epochs}")
         print(f"  Gradient accumulation: {cfg.gradient_accumulation}")
         print(f"  Learning rate: {cfg.learning_rate} (scheduler={cfg.lr_scheduler}, min_lr={cfg.min_lr})")
         print(f"  Flow: shift={cfg.shift}, logit_normal={cfg.logit_normal_sampling} (μ={cfg.logit_mean}, σ={cfg.logit_std})")
@@ -433,8 +429,8 @@ class Trainer:
         print(f"  Text dropout: {cfg.text_dropout}")
 
         while self.step < cfg.total_steps:
-            if max_epochs and self.epoch >= max_epochs:
-                print(f"\n✓ Reached max_epochs={max_epochs}")
+            if cfg.max_epochs and self.epoch >= cfg.max_epochs:
+                print(f"\n✓ Reached max_epochs={cfg.max_epochs}")
                 break
             self._train_epoch()
 
