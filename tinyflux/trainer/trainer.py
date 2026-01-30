@@ -31,7 +31,7 @@ from .losses import compute_main_loss, compute_lune_loss, compute_sol_loss, min_
 from .schedules import sample_timesteps, get_lune_weight, get_sol_weight, make_cosine_schedule
 from .ema import EMA
 from .cache_experts import MultiSourceCache
-from tinyflux.util.predictions import flow_x_t, flow_velocity
+from tinyflux.utils.predictions import flow_x_t, flow_velocity
 
 
 @dataclass
