@@ -279,7 +279,7 @@ class ModelZoo:
         repo_id: str = "AbstractPhil/tinyflux-experts",
         filename: str = "sd15-flow-lune-unet.safetensors",
         dtype: Optional[torch.dtype] = None,
-        compile_model: bool = True,
+        compile_model: bool = False,
     ) -> nn.Module:
         """
         Load Lune (SD1.5 UNet with flow-matching weights).
