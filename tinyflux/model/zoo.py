@@ -416,7 +416,13 @@ class ModelZoo:
         _ = self.sol(latents, t_scaled, encoder_hidden_states=clip_hidden)
 
         # Compute statistics from captured weights
-        return self._compute_attention_statistics(B, spatial_size)
+        stats, spatial = self._compute_attention_statistics(B, spatial_size)
+
+        # Clear storage to free memory
+        self._sol_attn_weights.clear()
+        torch.cuda.empty_cache()
+
+        return stats, spatial
 
     def _compute_attention_statistics(
         self,
@@ -443,8 +449,12 @@ class ModelZoo:
             attn = attn_weights.mean(dim=1)
             N = attn.shape[-1]
 
+            # Free the original attention weights immediately
+            del attn_weights
+
             # Skip cross-attention (non-square or wrong size)
             if H * W != N:
+                del attn
                 continue
 
             # === Entropy: how diffuse is each query's attention? ===
