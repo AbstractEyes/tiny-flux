@@ -279,7 +279,7 @@ class ModelZoo:
         repo_id: str = "AbstractPhil/tinyflux-experts",
         filename: str = "sd15-flow-lune-unet.safetensors",
         dtype: Optional[torch.dtype] = None,
-        compile_model: bool = False,
+        compile_model: bool = True,
     ) -> nn.Module:
         """
         Load Lune (SD1.5 UNet with flow-matching weights).
@@ -431,6 +431,9 @@ class ModelZoo:
         all_entropy = []
         all_spatial = []
 
+        captured_count = len(self._sol_attn_weights)
+        valid_count = 0
+
         for attn_weights, H, W in self._sol_attn_weights:
             # attn_weights: [B, heads, N, N] where N = H * W for self-attention
             if attn_weights.shape[0] != B:
@@ -481,6 +484,7 @@ class ModelZoo:
                 align_corners=False,
             ).squeeze(1)  # [B, spatial_size, spatial_size]
             all_spatial.append(spatial_resized)
+            valid_count += 1
 
         # Aggregate across layers
         if all_locality:
@@ -489,7 +493,8 @@ class ModelZoo:
             spatial = torch.stack(all_spatial).mean(dim=0)
             spatial = spatial / spatial.sum(dim=[-2, -1], keepdim=True)  # normalize
         else:
-            # Fallback (shouldn't happen)
+            # Fallback - this means attention capture failed
+            print(f"  [WARNING] Sol attention capture failed: {captured_count} captured, {valid_count} valid")
             locality = torch.full((B,), 0.5, device=device)
             entropy = torch.full((B,), 0.5, device=device)
             spatial = torch.ones(B, spatial_size, spatial_size, device=device) / (spatial_size ** 2)
@@ -610,11 +615,18 @@ class SolAttnProcessor:
             hidden_states = attn.spatial_norm(hidden_states, temb)
 
         input_ndim = hidden_states.ndim
+        channel = None  # Will be set for 4D input
         if input_ndim == 4:
             batch_size, channel, height, width = hidden_states.shape
             hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
         else:
-            height = width = None
+            batch_size, sequence_length, _ = hidden_states.shape
+            # Infer spatial dims from sequence length (assume square)
+            hw = int(sequence_length ** 0.5)
+            if hw * hw == sequence_length:
+                height = width = hw
+            else:
+                height = width = None
 
         batch_size, sequence_length, _ = hidden_states.shape
 
@@ -659,7 +671,7 @@ class SolAttnProcessor:
         # Dropout
         hidden_states = attn.to_out[1](hidden_states)
 
-        if input_ndim == 4:
+        if input_ndim == 4 and channel is not None:
             hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
 
         if attn.residual_connection:
