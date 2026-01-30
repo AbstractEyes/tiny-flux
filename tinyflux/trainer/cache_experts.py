@@ -973,6 +973,11 @@ class DatasetCache:
             # === Encodings ===
             enc_path = os.path.join(cache_dir, "encodings", f"shard_{shard_idx:04d}.pt")
             if not os.path.exists(enc_path):
+                # Ensure encoding models are on GPU
+                zoo.onload("vae")
+                zoo.onload("t5")
+                zoo.onload("clip")
+
                 enc = EncodingCache.build(zoo, shard_images, shard_prompts, batch_size, dtype=dtype)
                 enc.save(enc_path)
                 del enc
@@ -1029,6 +1034,16 @@ class DatasetCache:
             state['completed_shards'] = list(completed)
             with open(state_path, 'w') as f:
                 json.dump(state, f)
+
+            # Unload Sol after each shard to free VRAM for next encoding
+            if sol_loaded:
+                zoo.unload("sol")
+                sol_loaded = False
+
+            # Also unload Lune if still loaded (case: build_lune=True, build_sol=False)
+            if lune_loaded:
+                zoo.unload("lune")
+                lune_loaded = False
 
             print(f"    ✓ Shard {shard_idx + 1} saved")
 
@@ -1121,8 +1136,10 @@ class DatasetCache:
         """
         Build cache from a downloaded HuggingFace dataset.
 
-        Processes in chunks to avoid loading all images into RAM.
-        Saves shards to disk for resume capability.
+        Processes one model at a time across ALL chunks to avoid recompilation:
+        1. Encodings (VAE/T5/CLIP) for all chunks
+        2. Lune for all chunks
+        3. Sol for all chunks
 
         Args:
             zoo: ModelZoo instance
@@ -1139,17 +1156,6 @@ class DatasetCache:
             prompt_key: Key for prompt in dataset items
             prompt_transform: Optional function to transform prompts
             compile_experts: Whether to torch.compile Lune/Sol
-
-        Example:
-            from datasets import load_dataset
-            ds = load_dataset("my/dataset", split="train")  # Not streaming!
-
-            cache = DatasetCache.build_from_hf_dataset(
-                zoo=zoo,
-                dataset=ds,
-                cache_dir="./cache_shards",
-                prompt_transform=lambda p: f"prefix, {p}",
-            )
         """
         import json
 
@@ -1169,8 +1175,6 @@ class DatasetCache:
         if os.path.exists(state_path):
             with open(state_path, 'r') as f:
                 state = json.load(f)
-            completed = set(state.get('completed_chunks', []))
-            print(f"  Resuming from chunk {len(completed)}/{n_chunks}")
         else:
             state = {
                 'name': name,
@@ -1178,43 +1182,35 @@ class DatasetCache:
                 'chunk_size': chunk_size,
                 'build_lune': build_lune,
                 'build_sol': build_sol,
-                'completed_chunks': [],
+                'enc_done': [],
+                'lune_done': [],
+                'sol_done': [],
             }
-            completed = set()
+
+        enc_done = set(state.get('enc_done', []))
+        lune_done = set(state.get('lune_done', []))
+        sol_done = set(state.get('sol_done', []))
 
         print(f"Building cache: {name} ({n_samples} samples, {n_chunks} chunks)")
 
-        # Load encoding models
-        if zoo.vae is None:
-            print("    Loading VAE...")
-            zoo.load_vae()
-        if zoo.t5 is None:
-            print("    Loading T5...")
-            zoo.load_t5()
-        if zoo.clip is None:
-            print("    Loading CLIP...")
-            zoo.load_clip()
+        def save_state():
+            state['enc_done'] = list(enc_done)
+            state['lune_done'] = list(lune_done)
+            state['sol_done'] = list(sol_done)
+            with open(state_path, 'w') as f:
+                json.dump(state, f)
 
-        lune_loaded = False
-        sol_loaded = False
-
-        for chunk_idx in range(n_chunks):
-            if chunk_idx in completed:
-                continue
-
+        def load_chunk(chunk_idx):
+            """Load images and prompts for a chunk."""
             start_idx = chunk_idx * chunk_size
             end_idx = min(start_idx + chunk_size, n_samples)
 
-            print(f"  Chunk {chunk_idx + 1}/{n_chunks} (samples {start_idx}-{end_idx-1})...")
-
-            # Load chunk images and prompts
             chunk_images = []
             chunk_prompts = []
 
             for i in range(start_idx, end_idx):
                 item = dataset[i]
 
-                # Image
                 img = item[image_key]
                 if img.mode != "RGB":
                     img = img.convert("RGB")
@@ -1222,32 +1218,70 @@ class DatasetCache:
                     img = img.resize((512, 512), Image.Resampling.LANCZOS)
                 chunk_images.append(img)
 
-                # Prompt
                 prompt = item.get(prompt_key, "")
                 if prompt_transform is not None:
                     prompt = prompt_transform(prompt)
                 chunk_prompts.append(prompt)
 
-            # === Encodings ===
-            enc_path = os.path.join(enc_dir, f"shard_{chunk_idx:04d}.pt")
-            if not os.path.exists(enc_path):
+            return chunk_images, chunk_prompts
+
+        # =====================================================================
+        # PHASE 1: Encodings (VAE/T5/CLIP)
+        # =====================================================================
+        enc_remaining = [i for i in range(n_chunks) if i not in enc_done]
+        if enc_remaining:
+            print(f"\n  [1/3] Encodings ({len(enc_remaining)} chunks remaining)...")
+
+            if zoo.vae is None:
+                print("    Loading VAE...")
+                zoo.load_vae()
+            if zoo.t5 is None:
+                print("    Loading T5...")
+                zoo.load_t5()
+            if zoo.clip is None:
+                print("    Loading CLIP...")
+                zoo.load_clip()
+
+            for chunk_idx in tqdm(enc_remaining, desc="Encoding chunks"):
+                enc_path = os.path.join(enc_dir, f"shard_{chunk_idx:04d}.pt")
+                if os.path.exists(enc_path):
+                    enc_done.add(chunk_idx)
+                    continue
+
+                chunk_images, chunk_prompts = load_chunk(chunk_idx)
                 enc = EncodingCache.build(zoo, chunk_images, chunk_prompts, batch_size, dtype=dtype)
                 enc.save(enc_path)
-                del enc
+
+                del enc, chunk_images, chunk_prompts
                 torch.cuda.empty_cache()
 
-            # === Lune ===
-            if build_lune:
-                lune_path = os.path.join(cache_dir, "lune", f"shard_{chunk_idx:04d}.pt")
-                if not os.path.exists(lune_path):
-                    if not lune_loaded:
-                        zoo.offload("vae")
-                        zoo.offload("t5")
-                        if zoo.lune is None:
-                            print(f"    Loading Lune (compile={compile_experts})...")
-                            zoo.load_lune(compile_model=compile_experts)
-                        lune_loaded = True
+                enc_done.add(chunk_idx)
+                save_state()
 
+            # Unload encoding models
+            zoo.unload("vae")
+            zoo.unload("t5")
+            # Keep CLIP for Lune/Sol
+
+        # =====================================================================
+        # PHASE 2: Lune
+        # =====================================================================
+        if build_lune:
+            lune_remaining = [i for i in range(n_chunks) if i not in lune_done]
+            if lune_remaining:
+                print(f"\n  [2/3] Lune ({len(lune_remaining)} chunks remaining)...")
+
+                if zoo.lune is None:
+                    print(f"    Loading Lune (compile={compile_experts})...")
+                    zoo.load_lune(compile_model=compile_experts)
+
+                for chunk_idx in tqdm(lune_remaining, desc="Lune chunks"):
+                    lune_path = os.path.join(cache_dir, "lune", f"shard_{chunk_idx:04d}.pt")
+                    if os.path.exists(lune_path):
+                        lune_done.add(chunk_idx)
+                        continue
+
+                    _, chunk_prompts = load_chunk(chunk_idx)
                     lune_cache = LuneFeatureCache.build(
                         zoo, chunk_prompts,
                         batch_size=batch_size,
@@ -1255,23 +1289,36 @@ class DatasetCache:
                         batch_timesteps=True,
                     )
                     lune_cache.save(lune_path)
-                    del lune_cache
+
+                    del lune_cache, chunk_prompts
                     torch.cuda.empty_cache()
 
-            # === Sol ===
-            if build_sol:
-                sol_path = os.path.join(cache_dir, "sol", f"shard_{chunk_idx:04d}.pt")
-                if not os.path.exists(sol_path):
-                    if lune_loaded:
-                        zoo.unload("lune")
-                        lune_loaded = False
-                    if not sol_loaded:
-                        if zoo.sol is None:
-                            print(f"    Loading Sol (compile={compile_experts})...")
-                            zoo.load_sol(compile_model=compile_experts)
-                        sol_loaded = True
+                    lune_done.add(chunk_idx)
+                    save_state()
 
-                    sol_bs = sol_batch_size if sol_batch_size is not None else min(batch_size, 4)
+                zoo.unload("lune")
+
+        # =====================================================================
+        # PHASE 3: Sol
+        # =====================================================================
+        if build_sol:
+            sol_remaining = [i for i in range(n_chunks) if i not in sol_done]
+            if sol_remaining:
+                print(f"\n  [3/3] Sol ({len(sol_remaining)} chunks remaining)...")
+
+                if zoo.sol is None:
+                    print(f"    Loading Sol (compile={compile_experts})...")
+                    zoo.load_sol(compile_model=compile_experts)
+
+                sol_bs = sol_batch_size if sol_batch_size is not None else min(batch_size, 4)
+
+                for chunk_idx in tqdm(sol_remaining, desc="Sol chunks"):
+                    sol_path = os.path.join(cache_dir, "sol", f"shard_{chunk_idx:04d}.pt")
+                    if os.path.exists(sol_path):
+                        sol_done.add(chunk_idx)
+                        continue
+
+                    _, chunk_prompts = load_chunk(chunk_idx)
                     sol_cache = SolFeatureCache.build(
                         zoo, chunk_prompts,
                         batch_size=sol_bs,
@@ -1279,30 +1326,20 @@ class DatasetCache:
                         batch_timesteps=False,
                     )
                     sol_cache.save(sol_path)
-                    del sol_cache
+
+                    del sol_cache, chunk_prompts
                     torch.cuda.empty_cache()
 
-            # Mark chunk complete
-            completed.add(chunk_idx)
-            state['completed_chunks'] = list(completed)
-            with open(state_path, 'w') as f:
-                json.dump(state, f)
+                    sol_done.add(chunk_idx)
+                    save_state()
 
-            # Free chunk memory
-            del chunk_images
-            del chunk_prompts
+                zoo.unload("sol")
 
-            # Reload encoding models for next chunk if needed
-            if chunk_idx + 1 < n_chunks and not lune_loaded and not sol_loaded:
-                if zoo.vae is None:
-                    zoo.load_vae()
-                if zoo.t5 is None:
-                    zoo.load_t5()
-
-            print(f"    ✓ Shard {chunk_idx + 1} saved")
+        # Cleanup CLIP
+        zoo.unload("clip")
 
         # Merge all shards
-        print("  Merging shards...")
+        print("\n  Merging shards...")
         return cls.load_shards(cache_dir, name)
 
     @classmethod
@@ -1469,6 +1506,11 @@ class DatasetCache:
                 # === Encodings ===
                 enc_path = os.path.join(enc_dir, f"shard_{chunk_idx:04d}.pt")
                 if not os.path.exists(enc_path):
+                    # Ensure encoding models are on GPU
+                    zoo.onload("vae")
+                    zoo.onload("t5")
+                    zoo.onload("clip")
+
                     enc = EncodingCache.build(zoo, chunk_images, chunk_prompts, batch_size, dtype=dtype)
                     enc.save(enc_path)
                     del enc
@@ -1530,12 +1572,15 @@ class DatasetCache:
                 del chunk_images
                 del chunk_prompts
 
-                # Reload models for next chunk if needed
-                if chunk_idx + 1 < n_chunks and not lune_loaded and not sol_loaded:
-                    if zoo.vae is None:
-                        zoo.load_vae()
-                    if zoo.t5 is None:
-                        zoo.load_t5()
+                # Unload Sol after each chunk to free VRAM for next encoding
+                if sol_loaded:
+                    zoo.unload("sol")
+                    sol_loaded = False
+
+                # Also unload Lune if still loaded (case: build_lune=True, build_sol=False)
+                if lune_loaded:
+                    zoo.unload("lune")
+                    lune_loaded = False
 
                 chunk_idx += 1
 
