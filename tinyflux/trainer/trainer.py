@@ -548,16 +548,16 @@ class Trainer:
         """Single training step."""
         cfg = self.config
 
-        # Unpack batch
-        latents = batch['latents'].to(self.device, non_blocking=True)
-        t5 = batch['t5_embeds'].to(self.device, non_blocking=True)
-        clip = batch['clip_pooled'].to(self.device, non_blocking=True)
+        # Unpack batch and convert to training dtype
+        latents = batch['latents'].to(self.device, dtype=cfg.dtype, non_blocking=True)
+        t5 = batch['t5_embeds'].to(self.device, dtype=cfg.dtype, non_blocking=True)
+        clip = batch['clip_pooled'].to(self.device, dtype=cfg.dtype, non_blocking=True)
         local_indices = batch.get('local_indices')
         dataset_ids = batch.get('dataset_ids')
         masks = batch.get('masks')
 
         if masks is not None:
-            masks = masks.to(self.device, non_blocking=True)
+            masks = masks.to(self.device, dtype=cfg.dtype, non_blocking=True)
 
         B, C, H, W = latents.shape
 
@@ -596,12 +596,18 @@ class Trainer:
         if self.cache is not None and local_indices is not None and dataset_ids is not None:
             if cfg.enable_lune:
                 lune_features = self.cache.get_lune(local_indices, dataset_ids, t)
-                # Teacher dropout - forces model to use predictor
-                if lune_features is not None and random.random() < cfg.lune_dropout:
-                    lune_features = None
+                if lune_features is not None:
+                    lune_features = lune_features.to(dtype=cfg.dtype)
+                    # Teacher dropout - forces model to use predictor
+                    if random.random() < cfg.lune_dropout:
+                        lune_features = None
 
             if cfg.enable_sol:
                 sol_stats, sol_spatial = self.cache.get_sol(local_indices, dataset_ids, t)
+                if sol_stats is not None:
+                    sol_stats = sol_stats.to(dtype=cfg.dtype)
+                if sol_spatial is not None:
+                    sol_spatial = sol_spatial.to(dtype=cfg.dtype)
                 # Teacher dropout - forces model to use predictor
                 if sol_stats is not None and random.random() < cfg.sol_dropout:
                     sol_stats = None
