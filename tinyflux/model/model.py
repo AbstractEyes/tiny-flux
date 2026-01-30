@@ -317,6 +317,11 @@ class SolAttentionPrior(nn.Module):
             nn.Softplus(),
         )
 
+        # Convert spatial → Q/K modulation (zero-init: starts as identity)
+        self.spatial_to_qk_scale = nn.Linear(1, num_heads)
+        nn.init.zeros_(self.spatial_to_qk_scale.weight)
+        nn.init.ones_(self.spatial_to_qk_scale.bias)
+
         self.blend_gate = nn.Parameter(self._to_logit(geometric_weight))
         self._init_weights()
 
