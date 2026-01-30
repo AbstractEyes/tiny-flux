@@ -694,16 +694,28 @@ class DatasetCache:
         """
         Build complete cache from images and prompts.
 
-        Requires zoo with vae, clip, t5 loaded.
-        If build_lune=True, also needs lune loaded.
-        If build_sol=True, also needs sol loaded.
+        Models are auto-loaded as needed:
+        - Always loads: VAE, T5, CLIP
+        - If build_lune=True: loads Lune
+        - If build_sol=True: loads Sol
 
-        Models are unloaded between steps to manage VRAM.
+        Models are auto-loaded as needed and unloaded between steps to manage VRAM.
         """
         print(f"Building cache: {name}")
 
         # Encodings (VAE, T5, CLIP)
         print("  [1/3] Encodings...")
+        # Auto-load required models
+        if zoo.vae is None:
+            print("    Loading VAE...")
+            zoo.load_vae()
+        if zoo.t5 is None:
+            print("    Loading T5...")
+            zoo.load_t5()
+        if zoo.clip is None:
+            print("    Loading CLIP...")
+            zoo.load_clip()
+
         encodings = EncodingCache.build(zoo, images, prompts, batch_size, dtype=dtype)
 
         # Free VAE/T5 memory - keep CLIP for Lune/Sol
@@ -715,6 +727,9 @@ class DatasetCache:
         lune = None
         if build_lune:
             print("  [2/3] Lune features...")
+            if zoo.lune is None:
+                print("    Loading Lune...")
+                zoo.load_lune()
             lune = LuneFeatureCache.build(
                 zoo, prompts,
                 batch_size=batch_size,
@@ -729,6 +744,9 @@ class DatasetCache:
         sol = None
         if build_sol:
             print("  [3/3] Sol features...")
+            if zoo.sol is None:
+                print("    Loading Sol...")
+                zoo.load_sol()
             sol = SolFeatureCache.build(
                 zoo, prompts,
                 batch_size=batch_size,
