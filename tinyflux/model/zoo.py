@@ -457,12 +457,17 @@ class ModelZoo:
                 del attn
                 continue
 
+            # Cast to float32 for numerical stability
+            attn = attn.float()
+
             # === Entropy: how diffuse is each query's attention? ===
             # Higher entropy = more uniform attention
             # Lower entropy = focused on few keys
-            entropy_per_query = -(attn * (attn + 1e-8).log()).sum(dim=-1)  # [B, N]
-            max_entropy = torch.log(torch.tensor(N, dtype=torch.float32, device=device))
-            entropy = entropy_per_query.mean(dim=-1) / max_entropy  # [B], normalized to [0,1]
+            # Clamp to avoid log(0)
+            attn_clamped = attn.clamp(min=1e-8)
+            entropy_per_query = -(attn_clamped * attn_clamped.log()).sum(dim=-1)  # [B, N]
+            max_entropy = torch.log(torch.tensor(float(N), device=device))
+            entropy = (entropy_per_query.mean(dim=-1) / max_entropy).clamp(0, 1)  # [B], normalized to [0,1]
             all_entropy.append(entropy)
 
             # === Locality: do queries attend nearby or far? ===
@@ -478,17 +483,18 @@ class ModelZoo:
 
             # Expected distance per query weighted by attention
             expected_dist = (attn * dist.unsqueeze(0)).sum(dim=-1)  # [B, N]
-            locality = 1 - (expected_dist.mean(dim=-1) / max_dist)  # [B], higher = more local
+            locality = (1 - (expected_dist.mean(dim=-1) / max_dist)).clamp(0, 1)  # [B], higher = more local
             all_locality.append(locality)
 
             # === Spatial importance: where does attention aggregate? ===
             # Sum attention received by each key position
             importance = attn.sum(dim=1)  # [B, N] - total attention each position receives
+            importance = importance.clamp(min=0)  # Ensure non-negative
             spatial_map = importance.view(B, H, W)
 
             # Resize to target
             spatial_resized = torch.nn.functional.interpolate(
-                spatial_map.unsqueeze(1),
+                spatial_map.unsqueeze(1).float(),  # Ensure float32
                 size=(spatial_size, spatial_size),
                 mode='bilinear',
                 align_corners=False,
@@ -501,7 +507,10 @@ class ModelZoo:
             locality = torch.stack(all_locality).mean(dim=0)
             entropy = torch.stack(all_entropy).mean(dim=0)
             spatial = torch.stack(all_spatial).mean(dim=0)
-            spatial = spatial / spatial.sum(dim=[-2, -1], keepdim=True)  # normalize
+            # Normalize spatial, handling zeros
+            spatial_sum = spatial.sum(dim=[-2, -1], keepdim=True)
+            spatial_sum = spatial_sum.clamp(min=1e-8)
+            spatial = spatial / spatial_sum
         else:
             # Fallback - this means attention capture failed
             print(f"  [WARNING] Sol attention capture failed: {captured_count} captured, {valid_count} valid")
@@ -513,6 +522,21 @@ class ModelZoo:
         clustering = 1 - entropy
 
         stats = torch.stack([locality, entropy, clustering], dim=-1)  # [B, 3]
+
+        # Replace any NaN with fallback values
+        if torch.isnan(stats).any():
+            nan_mask = torch.isnan(stats)
+            fallback = torch.tensor([0.5, 0.5, 0.5], device=device)
+            stats = torch.where(nan_mask, fallback.expand_as(stats), stats)
+
+        # Handle NaN in spatial
+        if torch.isnan(spatial).any():
+            spatial = torch.where(
+                torch.isnan(spatial),
+                torch.ones_like(spatial) / (spatial_size ** 2),
+                spatial
+            )
+
         return stats, spatial
 
     # =========================================================================

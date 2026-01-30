@@ -117,11 +117,17 @@ class EncodingCache:
         max_t5_length: int = 128,
         dtype: torch.dtype = torch.float16,
         vae_scale: Optional[float] = None,
+        checkpoint_dir: Optional[str] = None,
+        checkpoint_every: int = 500,
     ) -> "EncodingCache":
         """
         Build encoding cache from images and prompts.
 
         Requires zoo with vae, clip, t5 loaded.
+
+        Args:
+            checkpoint_dir: If set, save progress every checkpoint_every samples
+            checkpoint_every: Save interval (samples)
         """
         device = zoo.device
         n = len(images)
@@ -130,12 +136,26 @@ class EncodingCache:
         if vae_scale is None:
             vae_scale = zoo.vae.config.scaling_factor
 
+        # Check for existing progress
+        start_idx = 0
         all_latents = []
         all_t5 = []
         all_clip = []
 
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            progress_file = os.path.join(checkpoint_dir, "encodings_progress.pt")
+            if os.path.exists(progress_file):
+                print(f"    Resuming encodings from checkpoint...")
+                progress = torch.load(progress_file, weights_only=False)
+                start_idx = progress['next_idx']
+                all_latents = progress['latents']
+                all_t5 = progress['t5']
+                all_clip = progress['clip']
+                print(f"    Loaded {start_idx}/{n} samples")
+
         with torch.no_grad():
-            for i in tqdm(range(0, n, batch_size), desc="Encoding"):
+            for i in tqdm(range(start_idx, n, batch_size), desc="Encoding", initial=start_idx//batch_size, total=(n+batch_size-1)//batch_size):
                 batch_imgs = images[i:i+batch_size]
                 batch_prompts = prompts[i:i+batch_size]
 
@@ -179,6 +199,20 @@ class EncodingCache:
                 ).to(device)
                 clip_out = zoo.clip(**clip_inputs).pooler_output
                 all_clip.append(clip_out.cpu().to(dtype))
+
+                # Checkpoint periodically
+                next_idx = min(i + batch_size, n)
+                if checkpoint_dir and (next_idx % checkpoint_every < batch_size or next_idx == n):
+                    torch.save({
+                        'next_idx': next_idx,
+                        'latents': all_latents,
+                        't5': all_t5,
+                        'clip': all_clip,
+                    }, progress_file)
+
+        # Clean up checkpoint after completion
+        if checkpoint_dir and os.path.exists(progress_file):
+            os.remove(progress_file)
 
         return cls(
             latents=torch.cat(all_latents, dim=0),
@@ -300,6 +334,8 @@ class LuneFeatureCache:
         dtype: torch.dtype = torch.float16,
         base_seed: int = EXTRACTION_BASE_SEED,
         batch_timesteps: bool = True,
+        checkpoint_dir: Optional[str] = None,
+        checkpoint_every: int = 500,
     ) -> "LuneFeatureCache":
         """
         Extract Lune mid-block features for all prompts at all timestep buckets.
@@ -312,6 +348,8 @@ class LuneFeatureCache:
             dtype: Storage dtype
             base_seed: Seed for reproducibility
             batch_timesteps: If True, process all timesteps in one forward (faster, more VRAM)
+            checkpoint_dir: If set, save progress every checkpoint_every samples
+            checkpoint_every: Save interval (samples)
         """
         device = zoo.device
 
@@ -321,12 +359,25 @@ class LuneFeatureCache:
         n_prompts = len(prompts)
         n_buckets = len(t_buckets)
 
+        # Check for existing progress
+        start_idx = 0
         all_features = torch.zeros(n_prompts, n_buckets, LUNE_DIM, dtype=dtype)
 
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            progress_file = os.path.join(checkpoint_dir, "lune_progress.pt")
+            if os.path.exists(progress_file):
+                print(f"    Resuming Lune from checkpoint...")
+                progress = torch.load(progress_file, weights_only=False)
+                start_idx = progress['next_idx']
+                all_features[:start_idx] = progress['features'][:start_idx]
+                print(f"    Loaded {start_idx}/{n_prompts} samples")
+
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
-            for start_idx in tqdm(range(0, n_prompts, batch_size), desc="Extracting Lune"):
-                end_idx = min(start_idx + batch_size, n_prompts)
-                batch_prompts = prompts[start_idx:end_idx]
+            for start in tqdm(range(start_idx, n_prompts, batch_size), desc="Extracting Lune",
+                             initial=start_idx//batch_size, total=(n_prompts+batch_size-1)//batch_size):
+                end_idx = min(start + batch_size, n_prompts)
+                batch_prompts = prompts[start:end_idx]
                 B = len(batch_prompts)
 
                 # Encode CLIP
@@ -350,7 +401,7 @@ class LuneFeatureCache:
                     t_all = t_buckets.unsqueeze(0).expand(B, -1).reshape(-1)
 
                     # Seeded latents for all timesteps
-                    gen = seed_batch_extraction(start_idx, B * n_buckets, 0, device, base_seed)
+                    gen = seed_batch_extraction(start, B * n_buckets, 0, device, base_seed)
                     latents = torch.randn(
                         B * n_buckets, 4, 64, 64,
                         generator=gen,
@@ -368,13 +419,13 @@ class LuneFeatureCache:
                             mid_features = mid_features.mean(dim=[2, 3])  # [B*n_buckets, 1280]
                         # Reshape back: [B*n_buckets, 1280] -> [B, n_buckets, 1280]
                         mid_features = mid_features.view(B, n_buckets, -1)
-                        all_features[start_idx:end_idx] = mid_features.cpu().to(dtype)
+                        all_features[start:end_idx] = mid_features.cpu().to(dtype)
                 else:
                     # === Sequential: One timestep at a time ===
                     for t_idx, t_val in enumerate(t_buckets):
                         t = torch.full((B,), t_val.item(), device=device)
 
-                        gen = seed_batch_extraction(start_idx, B, t_idx, device, base_seed)
+                        gen = seed_batch_extraction(start, B, t_idx, device, base_seed)
                         latents = torch.randn(
                             B, 4, 64, 64,
                             generator=gen,
@@ -389,7 +440,19 @@ class LuneFeatureCache:
                         if mid_features is not None:
                             if mid_features.dim() == 4:
                                 mid_features = mid_features.mean(dim=[2, 3])
-                            all_features[start_idx:end_idx, t_idx] = mid_features.cpu().to(dtype)
+                            all_features[start:end_idx, t_idx] = mid_features.cpu().to(dtype)
+
+                # Checkpoint periodically
+                next_idx = end_idx
+                if checkpoint_dir and (next_idx % checkpoint_every < batch_size or next_idx == n_prompts):
+                    torch.save({
+                        'next_idx': next_idx,
+                        'features': all_features,
+                    }, progress_file)
+
+        # Clean up checkpoint after completion
+        if checkpoint_dir and os.path.exists(progress_file):
+            os.remove(progress_file)
 
         return cls(all_features, t_buckets.cpu(), dtype)
 
@@ -500,6 +563,8 @@ class SolFeatureCache:
         dtype: torch.dtype = torch.float16,
         base_seed: int = EXTRACTION_BASE_SEED,
         batch_timesteps: bool = False,  # Default False - Sol attention is VRAM heavy
+        checkpoint_dir: Optional[str] = None,
+        checkpoint_every: int = 500,
     ) -> "SolFeatureCache":
         """
         Extract Sol attention statistics for all prompts at all timestep buckets.
@@ -513,6 +578,8 @@ class SolFeatureCache:
             dtype: Storage dtype
             base_seed: Seed for reproducibility
             batch_timesteps: If True, process all timesteps in one forward (faster but 10x VRAM)
+            checkpoint_dir: If set, save progress every checkpoint_every samples
+            checkpoint_every: Save interval (samples)
         """
         device = zoo.device
 
@@ -522,13 +589,27 @@ class SolFeatureCache:
         n_prompts = len(prompts)
         n_buckets = len(t_buckets)
 
+        # Check for existing progress
+        start_idx = 0
         all_stats = torch.zeros(n_prompts, n_buckets, SOL_STATS_DIM, dtype=dtype)
         all_spatial = torch.zeros(n_prompts, n_buckets, spatial_size, spatial_size, dtype=dtype)
 
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            progress_file = os.path.join(checkpoint_dir, "sol_progress.pt")
+            if os.path.exists(progress_file):
+                print(f"    Resuming Sol from checkpoint...")
+                progress = torch.load(progress_file, weights_only=False)
+                start_idx = progress['next_idx']
+                all_stats[:start_idx] = progress['stats'][:start_idx]
+                all_spatial[:start_idx] = progress['spatial'][:start_idx]
+                print(f"    Loaded {start_idx}/{n_prompts} samples")
+
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
-            for start_idx in tqdm(range(0, n_prompts, batch_size), desc="Extracting Sol"):
-                end_idx = min(start_idx + batch_size, n_prompts)
-                batch_prompts = prompts[start_idx:end_idx]
+            for start in tqdm(range(start_idx, n_prompts, batch_size), desc="Extracting Sol",
+                             initial=start_idx//batch_size, total=(n_prompts+batch_size-1)//batch_size):
+                end_idx = min(start + batch_size, n_prompts)
+                batch_prompts = prompts[start:end_idx]
                 B = len(batch_prompts)
 
                 # Encode CLIP
@@ -551,7 +632,7 @@ class SolFeatureCache:
                     t_all = t_buckets.unsqueeze(0).expand(B, -1).reshape(-1)
 
                     # Seeded latents
-                    gen = seed_batch_extraction(start_idx, B * n_buckets, 0, device, base_seed)
+                    gen = seed_batch_extraction(start, B * n_buckets, 0, device, base_seed)
                     latents = torch.randn(
                         B * n_buckets, 4, 64, 64,
                         generator=gen,
@@ -566,14 +647,14 @@ class SolFeatureCache:
                     stats = stats.view(B, n_buckets, -1)
                     spatial = spatial.view(B, n_buckets, spatial_size, spatial_size)
 
-                    all_stats[start_idx:end_idx] = stats.cpu().to(dtype)
-                    all_spatial[start_idx:end_idx] = spatial.cpu().to(dtype)
+                    all_stats[start:end_idx] = stats.cpu().to(dtype)
+                    all_spatial[start:end_idx] = spatial.cpu().to(dtype)
                 else:
                     # === Sequential: One timestep at a time ===
                     for t_idx, t_val in enumerate(t_buckets):
                         t = torch.full((B,), t_val.item(), device=device)
 
-                        gen = seed_batch_extraction(start_idx, B, t_idx, device, base_seed)
+                        gen = seed_batch_extraction(start, B, t_idx, device, base_seed)
                         latents = torch.randn(
                             B, 4, 64, 64,
                             generator=gen,
@@ -583,8 +664,21 @@ class SolFeatureCache:
 
                         stats, spatial = zoo.sol_forward(latents, t, clip_hidden.half(), spatial_size)
 
-                        all_stats[start_idx:end_idx, t_idx] = stats.cpu().to(dtype)
-                        all_spatial[start_idx:end_idx, t_idx] = spatial.cpu().to(dtype)
+                        all_stats[start:end_idx, t_idx] = stats.cpu().to(dtype)
+                        all_spatial[start:end_idx, t_idx] = spatial.cpu().to(dtype)
+
+                # Checkpoint periodically
+                next_idx = end_idx
+                if checkpoint_dir and (next_idx % checkpoint_every < batch_size or next_idx == n_prompts):
+                    torch.save({
+                        'next_idx': next_idx,
+                        'stats': all_stats,
+                        'spatial': all_spatial,
+                    }, progress_file)
+
+        # Clean up checkpoint after completion
+        if checkpoint_dir and os.path.exists(progress_file):
+            os.remove(progress_file)
 
         return cls(all_stats, all_spatial, t_buckets.cpu(), dtype)
 
@@ -689,7 +783,10 @@ class DatasetCache:
         build_lune: bool = True,
         build_sol: bool = True,
         batch_size: int = 32,
+        sol_batch_size: Optional[int] = None,  # None = auto (min of batch_size, 4)
         dtype: torch.dtype = torch.float16,
+        checkpoint_dir: Optional[str] = None,  # Save progress for resume
+        checkpoint_every: int = 500,  # Save every N samples
     ) -> "DatasetCache":
         """
         Build complete cache from images and prompts.
@@ -699,7 +796,21 @@ class DatasetCache:
         - If build_lune=True: loads Lune
         - If build_sol=True: loads Sol
 
-        Models are auto-loaded as needed and unloaded between steps to manage VRAM.
+        If checkpoint_dir is provided, saves progress periodically so builds
+        can resume from interruption.
+
+        Args:
+            zoo: ModelZoo instance
+            images: List of PIL images
+            prompts: List of text prompts
+            name: Cache name
+            build_lune: Whether to extract Lune features
+            build_sol: Whether to extract Sol features
+            batch_size: Batch size for encoding
+            sol_batch_size: Batch size for Sol (None = auto)
+            dtype: Storage dtype
+            checkpoint_dir: Directory to save progress (None = no checkpointing)
+            checkpoint_every: Save progress every N samples
         """
         print(f"Building cache: {name}")
 
@@ -716,7 +827,10 @@ class DatasetCache:
             print("    Loading CLIP...")
             zoo.load_clip()
 
-        encodings = EncodingCache.build(zoo, images, prompts, batch_size, dtype=dtype)
+        encodings = EncodingCache.build(
+            zoo, images, prompts, batch_size, dtype=dtype,
+            checkpoint_dir=checkpoint_dir, checkpoint_every=checkpoint_every,
+        )
 
         # Free VAE/T5 memory - keep CLIP for Lune/Sol
         zoo.offload("vae")
@@ -735,6 +849,8 @@ class DatasetCache:
                 batch_size=batch_size,
                 dtype=dtype,
                 batch_timesteps=True,  # Lune is lighter, can batch
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_every=checkpoint_every,
             )
             # Unload Lune before Sol
             zoo.unload("lune")
@@ -747,16 +863,238 @@ class DatasetCache:
             if zoo.sol is None:
                 print("    Loading Sol...")
                 zoo.load_sol()
-            # Sol captures full attention matrices - use small batch to avoid OOM
-            sol_batch = min(batch_size, 4)
+            # Sol captures full attention matrices - default to small batch to avoid OOM
+            sol_bs = sol_batch_size if sol_batch_size is not None else min(batch_size, 4)
             sol = SolFeatureCache.build(
                 zoo, prompts,
-                batch_size=sol_batch,
+                batch_size=sol_bs,
                 dtype=dtype,
                 batch_timesteps=False,  # Sol attention is heavy, don't batch timesteps
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_every=checkpoint_every,
             )
 
         print(f"  ✓ Cache complete: {len(encodings)} samples")
+        return cls(encodings, lune, sol, name)
+
+    @classmethod
+    def build_incremental(
+        cls,
+        zoo,
+        images: List[Image.Image],
+        prompts: List[str],
+        cache_dir: str,
+        name: str = "dataset",
+        build_lune: bool = True,
+        build_sol: bool = True,
+        batch_size: int = 32,
+        sol_batch_size: Optional[int] = None,
+        dtype: torch.dtype = torch.float16,
+        shard_size: int = 1000,
+    ) -> "DatasetCache":
+        """
+        Build cache incrementally with shard saving for resume capability.
+
+        Saves progress after each shard so interrupted builds can resume.
+
+        Directory structure:
+            cache_dir/
+                state.json          # Progress tracking
+                encodings/
+                    shard_0000.pt
+                    ...
+                lune/
+                    shard_0000.pt
+                    ...
+                sol/
+                    shard_0000.pt
+                    ...
+        """
+        import json
+
+        os.makedirs(cache_dir, exist_ok=True)
+        os.makedirs(os.path.join(cache_dir, "encodings"), exist_ok=True)
+        if build_lune:
+            os.makedirs(os.path.join(cache_dir, "lune"), exist_ok=True)
+        if build_sol:
+            os.makedirs(os.path.join(cache_dir, "sol"), exist_ok=True)
+
+        n_samples = len(images)
+        n_shards = (n_samples + shard_size - 1) // shard_size
+
+        # Load or create state
+        state_path = os.path.join(cache_dir, "state.json")
+        if os.path.exists(state_path):
+            with open(state_path, 'r') as f:
+                state = json.load(f)
+            print(f"  Resuming from shard {len(state.get('completed_shards', []))}/{n_shards}")
+        else:
+            state = {
+                'name': name,
+                'n_samples': n_samples,
+                'shard_size': shard_size,
+                'build_lune': build_lune,
+                'build_sol': build_sol,
+                'completed_shards': [],
+            }
+
+        completed = set(state.get('completed_shards', []))
+
+        print(f"Building cache: {name} ({n_samples} samples, {n_shards} shards)")
+
+        # Load models once
+        if zoo.vae is None:
+            print("    Loading VAE...")
+            zoo.load_vae()
+        if zoo.t5 is None:
+            print("    Loading T5...")
+            zoo.load_t5()
+        if zoo.clip is None:
+            print("    Loading CLIP...")
+            zoo.load_clip()
+
+        lune_loaded = False
+        sol_loaded = False
+
+        for shard_idx in range(n_shards):
+            if shard_idx in completed:
+                continue
+
+            start_idx = shard_idx * shard_size
+            end_idx = min(start_idx + shard_size, n_samples)
+            shard_images = images[start_idx:end_idx]
+            shard_prompts = prompts[start_idx:end_idx]
+
+            print(f"  Shard {shard_idx + 1}/{n_shards} (samples {start_idx}-{end_idx-1})...")
+
+            # === Encodings ===
+            enc_path = os.path.join(cache_dir, "encodings", f"shard_{shard_idx:04d}.pt")
+            if not os.path.exists(enc_path):
+                enc = EncodingCache.build(zoo, shard_images, shard_prompts, batch_size, dtype=dtype)
+                enc.save(enc_path)
+                del enc
+                torch.cuda.empty_cache()
+
+            # === Lune ===
+            if build_lune:
+                lune_path = os.path.join(cache_dir, "lune", f"shard_{shard_idx:04d}.pt")
+                if not os.path.exists(lune_path):
+                    if not lune_loaded:
+                        zoo.offload("vae")
+                        zoo.offload("t5")
+                        if zoo.lune is None:
+                            print("    Loading Lune...")
+                            zoo.load_lune()
+                        lune_loaded = True
+
+                    lune_cache = LuneFeatureCache.build(
+                        zoo, shard_prompts,
+                        batch_size=batch_size,
+                        dtype=dtype,
+                        batch_timesteps=True,
+                    )
+                    lune_cache.save(lune_path)
+                    del lune_cache
+                    torch.cuda.empty_cache()
+
+            # === Sol ===
+            if build_sol:
+                sol_path = os.path.join(cache_dir, "sol", f"shard_{shard_idx:04d}.pt")
+                if not os.path.exists(sol_path):
+                    if lune_loaded:
+                        zoo.unload("lune")
+                        lune_loaded = False
+                    if not sol_loaded:
+                        if zoo.sol is None:
+                            print("    Loading Sol...")
+                            zoo.load_sol()
+                        sol_loaded = True
+
+                    sol_bs = sol_batch_size if sol_batch_size is not None else min(batch_size, 4)
+                    sol_cache = SolFeatureCache.build(
+                        zoo, shard_prompts,
+                        batch_size=sol_bs,
+                        dtype=dtype,
+                        batch_timesteps=False,
+                    )
+                    sol_cache.save(sol_path)
+                    del sol_cache
+                    torch.cuda.empty_cache()
+
+            # Mark shard complete
+            completed.add(shard_idx)
+            state['completed_shards'] = list(completed)
+            with open(state_path, 'w') as f:
+                json.dump(state, f)
+
+            print(f"    ✓ Shard {shard_idx + 1} saved")
+
+        # Merge all shards
+        print("  Merging shards...")
+        return cls.load_shards(cache_dir, name)
+
+    @classmethod
+    def load_shards(cls, cache_dir: str, name: str = "dataset") -> "DatasetCache":
+        """Load and merge shards from incremental build."""
+        import json
+
+        state_path = os.path.join(cache_dir, "state.json")
+        with open(state_path, 'r') as f:
+            state = json.load(f)
+
+        # Find all shard files
+        enc_dir = os.path.join(cache_dir, "encodings")
+        enc_files = sorted([f for f in os.listdir(enc_dir) if f.endswith('.pt')])
+
+        # Load and concatenate encodings
+        all_latents = []
+        all_t5 = []
+        all_clip = []
+
+        for enc_file in tqdm(enc_files, desc="Loading encodings"):
+            enc = EncodingCache.load(os.path.join(enc_dir, enc_file))
+            all_latents.append(enc.latents)
+            all_t5.append(enc.t5_embeds)
+            all_clip.append(enc.clip_pooled)
+
+        encodings = EncodingCache(
+            torch.cat(all_latents, dim=0),
+            torch.cat(all_t5, dim=0),
+            torch.cat(all_clip, dim=0),
+        )
+
+        # Load Lune shards
+        lune = None
+        lune_dir = os.path.join(cache_dir, "lune")
+        if os.path.exists(lune_dir) and state.get('build_lune', False):
+            lune_files = sorted([f for f in os.listdir(lune_dir) if f.endswith('.pt')])
+            all_lune = []
+            for lune_file in tqdm(lune_files, desc="Loading lune"):
+                lune_cache = LuneFeatureCache.load(os.path.join(lune_dir, lune_file))
+                all_lune.append(lune_cache.features)
+            lune = LuneFeatureCache(
+                torch.cat(all_lune, dim=0),
+                lune_cache.t_buckets,
+            )
+
+        # Load Sol shards
+        sol = None
+        sol_dir = os.path.join(cache_dir, "sol")
+        if os.path.exists(sol_dir) and state.get('build_sol', False):
+            sol_files = sorted([f for f in os.listdir(sol_dir) if f.endswith('.pt')])
+            all_stats = []
+            all_spatial = []
+            for sol_file in tqdm(sol_files, desc="Loading sol"):
+                sol_cache = SolFeatureCache.load(os.path.join(sol_dir, sol_file))
+                all_stats.append(sol_cache.stats)
+                all_spatial.append(sol_cache.spatial)
+            sol = SolFeatureCache(
+                torch.cat(all_stats, dim=0),
+                torch.cat(all_spatial, dim=0),
+                sol_cache.t_buckets,
+            )
+
+        print(f"  ✓ Loaded {len(encodings)} samples from {len(enc_files)} shards")
         return cls(encodings, lune, sol, name)
 
     def __repr__(self) -> str:
