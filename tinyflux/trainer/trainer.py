@@ -412,12 +412,19 @@ class Trainer:
         self.writer.add_scalar('epoch/loss', epoch_loss, self.epoch)
         self.writer.add_scalar('epoch/step', self.step, self.epoch)
 
-    def train(self):
-        """Main training loop."""
+    def train(self, max_epochs: Optional[int] = None):
+        """
+        Main training loop.
+
+        Args:
+            max_epochs: If set, stop after this many epochs (otherwise runs to total_steps)
+        """
         cfg = self.config
 
         print(f"\nStarting training:")
         print(f"  Total steps: {cfg.total_steps}")
+        if max_epochs:
+            print(f"  Max epochs: {max_epochs}")
         print(f"  Gradient accumulation: {cfg.gradient_accumulation}")
         print(f"  Learning rate: {cfg.learning_rate} (scheduler={cfg.lr_scheduler}, min_lr={cfg.min_lr})")
         print(f"  Flow: shift={cfg.shift}, logit_normal={cfg.logit_normal_sampling} (μ={cfg.logit_mean}, σ={cfg.logit_std})")
@@ -426,6 +433,9 @@ class Trainer:
         print(f"  Text dropout: {cfg.text_dropout}")
 
         while self.step < cfg.total_steps:
+            if max_epochs and self.epoch >= max_epochs:
+                print(f"\n✓ Reached max_epochs={max_epochs}")
+                break
             self._train_epoch()
 
         # Final save
