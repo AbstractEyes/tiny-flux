@@ -747,11 +747,13 @@ class DatasetCache:
             if zoo.sol is None:
                 print("    Loading Sol...")
                 zoo.load_sol()
+            # Sol captures full attention matrices - use small batch to avoid OOM
+            sol_batch = min(batch_size, 4)
             sol = SolFeatureCache.build(
                 zoo, prompts,
-                batch_size=batch_size,
+                batch_size=sol_batch,
                 dtype=dtype,
-                batch_timesteps=False,  # Sol attention is heavy, don't batch
+                batch_timesteps=False,  # Sol attention is heavy, don't batch timesteps
             )
 
         print(f"  ✓ Cache complete: {len(encodings)} samples")
