@@ -787,6 +787,7 @@ class DatasetCache:
         dtype: torch.dtype = torch.float16,
         checkpoint_dir: Optional[str] = None,  # Save progress for resume
         checkpoint_every: int = 500,  # Save every N samples
+        compile_experts: bool = True,  # torch.compile Lune/Sol for faster extraction
     ) -> "DatasetCache":
         """
         Build complete cache from images and prompts.
@@ -811,6 +812,7 @@ class DatasetCache:
             dtype: Storage dtype
             checkpoint_dir: Directory to save progress (None = no checkpointing)
             checkpoint_every: Save progress every N samples
+            compile_experts: Whether to torch.compile Lune/Sol (~30% faster after warmup)
         """
         print(f"Building cache: {name}")
 
@@ -842,8 +844,8 @@ class DatasetCache:
         if build_lune:
             print("  [2/3] Lune features...")
             if zoo.lune is None:
-                print("    Loading Lune...")
-                zoo.load_lune()
+                print(f"    Loading Lune (compile={compile_experts})...")
+                zoo.load_lune(compile_model=compile_experts)
             lune = LuneFeatureCache.build(
                 zoo, prompts,
                 batch_size=batch_size,
@@ -861,8 +863,8 @@ class DatasetCache:
         if build_sol:
             print("  [3/3] Sol features...")
             if zoo.sol is None:
-                print("    Loading Sol...")
-                zoo.load_sol()
+                print(f"    Loading Sol (compile={compile_experts})...")
+                zoo.load_sol(compile_model=compile_experts)
             # Sol captures full attention matrices - default to small batch to avoid OOM
             sol_bs = sol_batch_size if sol_batch_size is not None else min(batch_size, 4)
             sol = SolFeatureCache.build(
@@ -891,6 +893,7 @@ class DatasetCache:
         sol_batch_size: Optional[int] = None,
         dtype: torch.dtype = torch.float16,
         shard_size: int = 1000,
+        compile_experts: bool = True,
     ) -> "DatasetCache":
         """
         Build cache incrementally with shard saving for resume capability.
@@ -983,8 +986,8 @@ class DatasetCache:
                         zoo.offload("vae")
                         zoo.offload("t5")
                         if zoo.lune is None:
-                            print("    Loading Lune...")
-                            zoo.load_lune()
+                            print(f"    Loading Lune (compile={compile_experts})...")
+                            zoo.load_lune(compile_model=compile_experts)
                         lune_loaded = True
 
                     lune_cache = LuneFeatureCache.build(
@@ -1006,8 +1009,8 @@ class DatasetCache:
                         lune_loaded = False
                     if not sol_loaded:
                         if zoo.sol is None:
-                            print("    Loading Sol...")
-                            zoo.load_sol()
+                            print(f"    Loading Sol (compile={compile_experts})...")
+                            zoo.load_sol(compile_model=compile_experts)
                         sol_loaded = True
 
                     sol_bs = sol_batch_size if sol_batch_size is not None else min(batch_size, 4)
@@ -1096,6 +1099,449 @@ class DatasetCache:
 
         print(f"  ✓ Loaded {len(encodings)} samples from {len(enc_files)} shards")
         return cls(encodings, lune, sol, name)
+
+    @classmethod
+    def build_from_hf_dataset(
+        cls,
+        zoo,
+        dataset,  # HuggingFace Dataset (indexed, not streaming)
+        cache_dir: str,
+        name: str = "dataset",
+        build_lune: bool = True,
+        build_sol: bool = True,
+        batch_size: int = 32,
+        sol_batch_size: Optional[int] = None,
+        dtype: torch.dtype = torch.float16,
+        chunk_size: int = 500,
+        image_key: str = "image",
+        prompt_key: str = "prompt",
+        prompt_transform: Optional[callable] = None,
+        compile_experts: bool = True,
+    ) -> "DatasetCache":
+        """
+        Build cache from a downloaded HuggingFace dataset.
+
+        Processes in chunks to avoid loading all images into RAM.
+        Saves shards to disk for resume capability.
+
+        Args:
+            zoo: ModelZoo instance
+            dataset: HuggingFace Dataset object (must support indexing)
+            cache_dir: Directory to save shards
+            name: Cache name
+            build_lune: Whether to extract Lune features
+            build_sol: Whether to extract Sol features
+            batch_size: Batch size for encoding
+            sol_batch_size: Batch size for Sol (None = auto)
+            dtype: Storage dtype
+            chunk_size: Samples to process at a time
+            image_key: Key for image in dataset items
+            prompt_key: Key for prompt in dataset items
+            prompt_transform: Optional function to transform prompts
+            compile_experts: Whether to torch.compile Lune/Sol
+
+        Example:
+            from datasets import load_dataset
+            ds = load_dataset("my/dataset", split="train")  # Not streaming!
+
+            cache = DatasetCache.build_from_hf_dataset(
+                zoo=zoo,
+                dataset=ds,
+                cache_dir="./cache_shards",
+                prompt_transform=lambda p: f"prefix, {p}",
+            )
+        """
+        import json
+
+        n_samples = len(dataset)
+        n_chunks = (n_samples + chunk_size - 1) // chunk_size
+
+        os.makedirs(cache_dir, exist_ok=True)
+        enc_dir = os.path.join(cache_dir, "encodings")
+        os.makedirs(enc_dir, exist_ok=True)
+        if build_lune:
+            os.makedirs(os.path.join(cache_dir, "lune"), exist_ok=True)
+        if build_sol:
+            os.makedirs(os.path.join(cache_dir, "sol"), exist_ok=True)
+
+        # Load or create state
+        state_path = os.path.join(cache_dir, "state.json")
+        if os.path.exists(state_path):
+            with open(state_path, 'r') as f:
+                state = json.load(f)
+            completed = set(state.get('completed_chunks', []))
+            print(f"  Resuming from chunk {len(completed)}/{n_chunks}")
+        else:
+            state = {
+                'name': name,
+                'n_samples': n_samples,
+                'chunk_size': chunk_size,
+                'build_lune': build_lune,
+                'build_sol': build_sol,
+                'completed_chunks': [],
+            }
+            completed = set()
+
+        print(f"Building cache: {name} ({n_samples} samples, {n_chunks} chunks)")
+
+        # Load encoding models
+        if zoo.vae is None:
+            print("    Loading VAE...")
+            zoo.load_vae()
+        if zoo.t5 is None:
+            print("    Loading T5...")
+            zoo.load_t5()
+        if zoo.clip is None:
+            print("    Loading CLIP...")
+            zoo.load_clip()
+
+        lune_loaded = False
+        sol_loaded = False
+
+        for chunk_idx in range(n_chunks):
+            if chunk_idx in completed:
+                continue
+
+            start_idx = chunk_idx * chunk_size
+            end_idx = min(start_idx + chunk_size, n_samples)
+
+            print(f"  Chunk {chunk_idx + 1}/{n_chunks} (samples {start_idx}-{end_idx-1})...")
+
+            # Load chunk images and prompts
+            chunk_images = []
+            chunk_prompts = []
+
+            for i in range(start_idx, end_idx):
+                item = dataset[i]
+
+                # Image
+                img = item[image_key]
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                if img.size != (512, 512):
+                    img = img.resize((512, 512), Image.Resampling.LANCZOS)
+                chunk_images.append(img)
+
+                # Prompt
+                prompt = item.get(prompt_key, "")
+                if prompt_transform is not None:
+                    prompt = prompt_transform(prompt)
+                chunk_prompts.append(prompt)
+
+            # === Encodings ===
+            enc_path = os.path.join(enc_dir, f"shard_{chunk_idx:04d}.pt")
+            if not os.path.exists(enc_path):
+                enc = EncodingCache.build(zoo, chunk_images, chunk_prompts, batch_size, dtype=dtype)
+                enc.save(enc_path)
+                del enc
+                torch.cuda.empty_cache()
+
+            # === Lune ===
+            if build_lune:
+                lune_path = os.path.join(cache_dir, "lune", f"shard_{chunk_idx:04d}.pt")
+                if not os.path.exists(lune_path):
+                    if not lune_loaded:
+                        zoo.offload("vae")
+                        zoo.offload("t5")
+                        if zoo.lune is None:
+                            print(f"    Loading Lune (compile={compile_experts})...")
+                            zoo.load_lune(compile_model=compile_experts)
+                        lune_loaded = True
+
+                    lune_cache = LuneFeatureCache.build(
+                        zoo, chunk_prompts,
+                        batch_size=batch_size,
+                        dtype=dtype,
+                        batch_timesteps=True,
+                    )
+                    lune_cache.save(lune_path)
+                    del lune_cache
+                    torch.cuda.empty_cache()
+
+            # === Sol ===
+            if build_sol:
+                sol_path = os.path.join(cache_dir, "sol", f"shard_{chunk_idx:04d}.pt")
+                if not os.path.exists(sol_path):
+                    if lune_loaded:
+                        zoo.unload("lune")
+                        lune_loaded = False
+                    if not sol_loaded:
+                        if zoo.sol is None:
+                            print(f"    Loading Sol (compile={compile_experts})...")
+                            zoo.load_sol(compile_model=compile_experts)
+                        sol_loaded = True
+
+                    sol_bs = sol_batch_size if sol_batch_size is not None else min(batch_size, 4)
+                    sol_cache = SolFeatureCache.build(
+                        zoo, chunk_prompts,
+                        batch_size=sol_bs,
+                        dtype=dtype,
+                        batch_timesteps=False,
+                    )
+                    sol_cache.save(sol_path)
+                    del sol_cache
+                    torch.cuda.empty_cache()
+
+            # Mark chunk complete
+            completed.add(chunk_idx)
+            state['completed_chunks'] = list(completed)
+            with open(state_path, 'w') as f:
+                json.dump(state, f)
+
+            # Free chunk memory
+            del chunk_images
+            del chunk_prompts
+
+            # Reload encoding models for next chunk if needed
+            if chunk_idx + 1 < n_chunks and not lune_loaded and not sol_loaded:
+                if zoo.vae is None:
+                    zoo.load_vae()
+                if zoo.t5 is None:
+                    zoo.load_t5()
+
+            print(f"    ✓ Shard {chunk_idx + 1} saved")
+
+        # Merge all shards
+        print("  Merging shards...")
+        return cls.load_shards(cache_dir, name)
+
+    @classmethod
+    def build_streaming(
+        cls,
+        zoo,
+        dataset_iterator,  # Iterator yielding (image, prompt) or dict with 'image' and 'prompt'
+        n_samples: int,
+        cache_dir: str,
+        name: str = "dataset",
+        build_lune: bool = True,
+        build_sol: bool = True,
+        batch_size: int = 32,
+        sol_batch_size: Optional[int] = None,
+        dtype: torch.dtype = torch.float16,
+        chunk_size: int = 500,  # Process this many samples at a time
+        image_key: str = "image",
+        prompt_key: str = "prompt",
+        prompt_transform: Optional[callable] = None,  # Optional function to transform prompts
+        compile_experts: bool = True,  # torch.compile Lune/Sol for faster extraction
+    ) -> "DatasetCache":
+        """
+        Build cache by streaming from an iterator (e.g., HuggingFace dataset).
+
+        Only keeps one chunk of images in memory at a time.
+        Saves intermediate shards to disk for resume capability.
+
+        Args:
+            zoo: ModelZoo instance
+            dataset_iterator: Iterator yielding dicts with image/prompt keys
+            n_samples: Total number of samples to process
+            cache_dir: Directory to save shards
+            name: Cache name
+            build_lune: Whether to extract Lune features
+            build_sol: Whether to extract Sol features
+            batch_size: Batch size for encoding
+            sol_batch_size: Batch size for Sol (None = auto)
+            dtype: Storage dtype
+            chunk_size: Samples to hold in memory at once
+            image_key: Key for image in dataset items
+            prompt_key: Key for prompt in dataset items
+            prompt_transform: Optional function to transform prompts
+            compile_experts: Whether to torch.compile Lune/Sol (~30% faster after warmup)
+
+        Example:
+            from datasets import load_dataset
+            ds = load_dataset("my/dataset", split="train", streaming=True)
+
+            cache = DatasetCache.build_streaming(
+                zoo=zoo,
+                dataset_iterator=ds,
+                n_samples=50000,
+                cache_dir="./cache_shards",
+                prompt_transform=lambda p: f"prefix, {p}",
+            )
+        """
+        import json
+
+        os.makedirs(cache_dir, exist_ok=True)
+        enc_dir = os.path.join(cache_dir, "encodings")
+        os.makedirs(enc_dir, exist_ok=True)
+        if build_lune:
+            os.makedirs(os.path.join(cache_dir, "lune"), exist_ok=True)
+        if build_sol:
+            os.makedirs(os.path.join(cache_dir, "sol"), exist_ok=True)
+
+        n_chunks = (n_samples + chunk_size - 1) // chunk_size
+
+        # Load or create state
+        state_path = os.path.join(cache_dir, "state.json")
+        if os.path.exists(state_path):
+            with open(state_path, 'r') as f:
+                state = json.load(f)
+            print(f"  Resuming from chunk {len(state.get('completed_chunks', []))}/{n_chunks}")
+        else:
+            state = {
+                'name': name,
+                'n_samples': n_samples,
+                'chunk_size': chunk_size,
+                'build_lune': build_lune,
+                'build_sol': build_sol,
+                'completed_chunks': [],
+            }
+
+        completed = set(state.get('completed_chunks', []))
+
+        print(f"Building cache: {name} ({n_samples} samples, {n_chunks} chunks)")
+
+        # Load models
+        if zoo.vae is None:
+            print("    Loading VAE...")
+            zoo.load_vae()
+        if zoo.t5 is None:
+            print("    Loading T5...")
+            zoo.load_t5()
+        if zoo.clip is None:
+            print("    Loading CLIP...")
+            zoo.load_clip()
+
+        lune_loaded = False
+        sol_loaded = False
+
+        # Process iterator
+        chunk_idx = 0
+        chunk_images = []
+        chunk_prompts = []
+        samples_processed = 0
+
+        iterator = iter(dataset_iterator)
+
+        with tqdm(total=n_samples, desc="Streaming") as pbar:
+            # Skip to resume point
+            skip_count = len(completed) * chunk_size
+            for _ in range(skip_count):
+                try:
+                    next(iterator)
+                    pbar.update(1)
+                except StopIteration:
+                    break
+
+            chunk_idx = len(completed)
+            samples_processed = skip_count
+
+            while samples_processed < n_samples:
+                # Collect one chunk
+                chunk_images = []
+                chunk_prompts = []
+
+                for _ in range(chunk_size):
+                    if samples_processed >= n_samples:
+                        break
+                    try:
+                        item = next(iterator)
+                    except StopIteration:
+                        break
+
+                    # Extract image
+                    img = item[image_key]
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    if img.size != (512, 512):
+                        img = img.resize((512, 512), Image.Resampling.LANCZOS)
+                    chunk_images.append(img)
+
+                    # Extract prompt
+                    prompt = item.get(prompt_key, "")
+                    if prompt_transform is not None:
+                        prompt = prompt_transform(prompt)
+                    chunk_prompts.append(prompt)
+
+                    samples_processed += 1
+                    pbar.update(1)
+
+                if not chunk_images:
+                    break
+
+                # Skip if already completed
+                if chunk_idx in completed:
+                    chunk_idx += 1
+                    continue
+
+                print(f"\n  Processing chunk {chunk_idx + 1}/{n_chunks} ({len(chunk_images)} samples)...")
+
+                # === Encodings ===
+                enc_path = os.path.join(enc_dir, f"shard_{chunk_idx:04d}.pt")
+                if not os.path.exists(enc_path):
+                    enc = EncodingCache.build(zoo, chunk_images, chunk_prompts, batch_size, dtype=dtype)
+                    enc.save(enc_path)
+                    del enc
+                    torch.cuda.empty_cache()
+
+                # === Lune ===
+                if build_lune:
+                    lune_path = os.path.join(cache_dir, "lune", f"shard_{chunk_idx:04d}.pt")
+                    if not os.path.exists(lune_path):
+                        if not lune_loaded:
+                            zoo.offload("vae")
+                            zoo.offload("t5")
+                            if zoo.lune is None:
+                                print(f"    Loading Lune (compile={compile_experts})...")
+                                zoo.load_lune(compile_model=compile_experts)
+                            lune_loaded = True
+
+                        lune_cache = LuneFeatureCache.build(
+                            zoo, chunk_prompts,
+                            batch_size=batch_size,
+                            dtype=dtype,
+                            batch_timesteps=True,
+                        )
+                        lune_cache.save(lune_path)
+                        del lune_cache
+                        torch.cuda.empty_cache()
+
+                # === Sol ===
+                if build_sol:
+                    sol_path = os.path.join(cache_dir, "sol", f"shard_{chunk_idx:04d}.pt")
+                    if not os.path.exists(sol_path):
+                        if lune_loaded:
+                            zoo.unload("lune")
+                            lune_loaded = False
+                        if not sol_loaded:
+                            if zoo.sol is None:
+                                print(f"    Loading Sol (compile={compile_experts})...")
+                                zoo.load_sol(compile_model=compile_experts)
+                            sol_loaded = True
+
+                        sol_bs = sol_batch_size if sol_batch_size is not None else min(batch_size, 4)
+                        sol_cache = SolFeatureCache.build(
+                            zoo, chunk_prompts,
+                            batch_size=sol_bs,
+                            dtype=dtype,
+                            batch_timesteps=False,
+                        )
+                        sol_cache.save(sol_path)
+                        del sol_cache
+                        torch.cuda.empty_cache()
+
+                # Mark chunk complete
+                completed.add(chunk_idx)
+                state['completed_chunks'] = list(completed)
+                with open(state_path, 'w') as f:
+                    json.dump(state, f)
+
+                # Free chunk memory
+                del chunk_images
+                del chunk_prompts
+
+                # Reload models for next chunk if needed
+                if chunk_idx + 1 < n_chunks and not lune_loaded and not sol_loaded:
+                    if zoo.vae is None:
+                        zoo.load_vae()
+                    if zoo.t5 is None:
+                        zoo.load_t5()
+
+                chunk_idx += 1
+
+        # Merge all shards
+        print("  Merging shards...")
+        return cls.load_shards(cache_dir, name)
 
     def __repr__(self) -> str:
         return f"DatasetCache(name={self.name}, n={len(self)}, lune={self.lune is not None}, sol={self.sol is not None})"
