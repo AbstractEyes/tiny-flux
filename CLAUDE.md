@@ -238,42 +238,107 @@ t=0 is pure noise, t=1 is data. Flux shift biases sampling toward higher t.
 Training saves:
 - `step_N.pt` - full checkpoint (model, optimizer, scheduler, EMA)
 - `step_N_ema.safetensors` - EMA weights only (for inference)
+- `epoch_N.pt` / `epoch_N_ema.safetensors` - epoch checkpoints
 - `best.pt` / `best_ema.safetensors` - best validation loss
+- `config.json` - model architecture config
+- `training_config.json` - training hyperparameters
 
-## Config Defaults
+## Model Config
+
+```python
+TinyFluxConfig(
+    # Architecture
+    hidden_size=512,
+    num_attention_heads=4,
+    attention_head_dim=128,
+    num_double_layers=15,         # Joint attention blocks
+    num_single_layers=25,         # Self-attention blocks
+    mlp_ratio=4.0,
+    
+    # Lune (trajectory guidance)
+    use_lune_expert=True,
+    lune_expert_dim=1280,
+    lune_hidden_dim=512,
+    lune_dropout=0.1,
+    
+    # Sol (attention prior)
+    use_sol_prior=True,
+    sol_spatial_size=8,
+    sol_hidden_dim=256,
+    sol_geometric_weight=0.7,
+)
+```
+
+## Trainer Config
 
 ```python
 TrainerConfig(
+    # Optimization
     learning_rate=1e-4,
+    optimizer="adamw",            # "adamw", "adamw_8bit", "adafactor"
+    weight_decay=0.01,
+    grad_clip=1.0,
+    
+    # Schedule
     total_steps=100000,
+    warmup_steps=1000,
+    lr_scheduler="cosine",        # "cosine", "linear", "constant"
+    min_lr=0.0,                   # Minimum LR for cosine decay
+    warmup_type="linear",         # "linear", "cosine"
+    
+    # Memory
+    gradient_checkpointing=False, # Trade compute for VRAM
+    compile_mode=None,            # "reduce-overhead", "max-autotune"
     gradient_accumulation=1,
+    
+    # EMA
     ema_decay=0.9999,
-    shift=3.0,                    # Flux shift
+    
+    # Flow matching
+    shift=3.0,                    # Flux shift parameter
+    logit_normal_sampling=True,   # vs uniform
+    logit_mean=0.0,               # Bias timestep distribution
+    logit_std=1.0,
+    
+    # Loss
     use_snr_weighting=True,
+    snr_gamma=5.0,
+    use_huber_loss=False,
     
     # Expert distillation
     enable_lune=True,
     lune_weight=0.1,
     lune_warmup_steps=1000,
-    lune_dropout=0.1,
+    lune_dropout=0.1,             # Teacher dropout
+    
     enable_sol=True,
     sol_weight=0.05,
     sol_warmup_steps=2000,
+    sol_dropout=0.1,              # Teacher dropout
+    
+    # Text
+    text_dropout=0.0,             # CFG training dropout
     
     # Checkpointing
-    save_every_steps=5000,        # Step-based checkpoints
-    keep_last_n_steps=3,          # Rolling cleanup
-    save_every_epochs=1,          # Epoch-based checkpoints
+    checkpoint_dir="checkpoints",
+    save_every_steps=5000,
+    keep_last_n_steps=3,
+    save_every_epochs=1,
     keep_last_n_epochs=3,
     
     # Logging
-    tensorboard_dir="logs",       # TensorBoard output
+    tensorboard_dir="logs",
     log_every=100,
     
+    # Sampling
+    sample_every=2000,
+    sample_prompts=["a cat", "a dog"],
+    sample_dir="samples",
+    
     # HuggingFace upload
-    hf_repo_id="user/model",      # Optional HF repo
-    upload_every_steps=0,         # 0 to disable
-    upload_every_epochs=1,        # Upload after each epoch
+    hf_repo_id="user/model",
+    upload_every_steps=0,
+    upload_every_epochs=1,
 )
 ```
 

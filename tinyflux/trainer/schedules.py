@@ -35,59 +35,65 @@ def flux_unshift(t: torch.Tensor, shift: float = 3.0) -> torch.Tensor:
 
 
 def sample_timesteps(
-        batch_size: int,
-        device: str = "cuda",
-        shift: float = 3.0,
-        min_t: float = 1e-4,
-        max_t: float = 1 - 1e-4,
+    batch_size: int,
+    device: str = "cuda",
+    shift: float = 3.0,
+    min_t: float = 1e-4,
+    max_t: float = 1 - 1e-4,
+    logit_normal: bool = True,
+    logit_mean: float = 0.0,
+    logit_std: float = 1.0,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """
-    Sample timesteps using logit-normal distribution with flux shift.
-
-    This is the standard Flux/SD3 timestep sampling:
-    1. Sample from N(0,1)
-    2. Apply sigmoid to get [0,1]
-    3. Apply flux_shift to bias toward higher t
-    4. Clamp to avoid numerical issues at boundaries
+    Sample timesteps for flow matching training.
 
     Args:
         batch_size: number of timesteps to sample
         device: torch device
-        shift: flux shift factor
+        shift: flux shift factor (higher = more bias toward t=1)
         min_t: minimum timestep
         max_t: maximum timestep
+        logit_normal: if True, use logit-normal; if False, uniform
+        logit_mean: mean for logit-normal distribution
+        logit_std: std for logit-normal distribution
+        dtype: output dtype
 
     Returns:
         t: [B] timesteps in [min_t, max_t]
     """
-    # Logit-normal: sigmoid of Gaussian
-    t = torch.sigmoid(torch.randn(batch_size, device=device))
+    if logit_normal:
+        # Logit-normal: sigmoid(mean + std * N(0,1))
+        t = torch.sigmoid(logit_mean + logit_std * torch.randn(batch_size, device=device))
+    else:
+        # Uniform
+        t = torch.rand(batch_size, device=device)
 
     # Flux shift
     t = flux_shift(t, shift=shift)
 
     # Clamp to valid range
-    t = t.clamp(min_t, max_t)
+    t = t.clamp(min_t, max_t).to(dtype)
 
     return t
 
 
 def sample_timesteps_uniform(
-        batch_size: int,
-        device: str = "cuda",
-        min_t: float = 1e-4,
-        max_t: float = 1 - 1e-4,
+    batch_size: int,
+    device: str = "cuda",
+    min_t: float = 1e-4,
+    max_t: float = 1 - 1e-4,
 ) -> torch.Tensor:
     """Sample timesteps uniformly (no shift)."""
     return torch.rand(batch_size, device=device) * (max_t - min_t) + min_t
 
 
 def sample_timesteps_stratified(
-        batch_size: int,
-        device: str = "cuda",
-        shift: float = 3.0,
-        min_t: float = 1e-4,
-        max_t: float = 1 - 1e-4,
+    batch_size: int,
+    device: str = "cuda",
+    shift: float = 3.0,
+    min_t: float = 1e-4,
+    max_t: float = 1 - 1e-4,
 ) -> torch.Tensor:
     """
     Stratified timestep sampling - ensures coverage across range.
@@ -127,18 +133,18 @@ def linear_warmup(step: int, warmup_steps: int, target_weight: float) -> float:
 
 
 def get_lune_weight(
-        step: int,
-        warmup_steps: int = 1000,
-        target_weight: float = 0.1,
+    step: int,
+    warmup_steps: int = 1000,
+    target_weight: float = 0.1,
 ) -> float:
     """Get Lune distillation loss weight with warmup."""
     return linear_warmup(step, warmup_steps, target_weight)
 
 
 def get_sol_weight(
-        step: int,
-        warmup_steps: int = 2000,
-        target_weight: float = 0.05,
+    step: int,
+    warmup_steps: int = 2000,
+    target_weight: float = 0.05,
 ) -> float:
     """Get Sol distillation loss weight with warmup."""
     return linear_warmup(step, warmup_steps, target_weight)
@@ -149,10 +155,10 @@ def get_sol_weight(
 # =============================================================================
 
 def cosine_schedule(
-        step: int,
-        total_steps: int,
-        warmup_steps: int = 1000,
-        min_lr_ratio: float = 0.0,
+    step: int,
+    total_steps: int,
+    warmup_steps: int = 1000,
+    min_lr_ratio: float = 0.0,
 ) -> float:
     """
     Cosine learning rate schedule with linear warmup.
@@ -176,8 +182,8 @@ def cosine_schedule(
 
 
 def constant_with_warmup(
-        step: int,
-        warmup_steps: int = 1000,
+    step: int,
+    warmup_steps: int = 1000,
 ) -> float:
     """Constant LR with linear warmup."""
     if step < warmup_steps:
@@ -186,10 +192,10 @@ def constant_with_warmup(
 
 
 def linear_decay(
-        step: int,
-        total_steps: int,
-        warmup_steps: int = 1000,
-        min_lr_ratio: float = 0.0,
+    step: int,
+    total_steps: int,
+    warmup_steps: int = 1000,
+    min_lr_ratio: float = 0.0,
 ) -> float:
     """Linear decay with warmup."""
     if step < warmup_steps:
@@ -205,19 +211,15 @@ def linear_decay(
 
 def make_cosine_schedule(total_steps: int, warmup_steps: int = 1000):
     """Create a cosine schedule function for LambdaLR."""
-
     def schedule(step):
         return cosine_schedule(step, total_steps, warmup_steps)
-
     return schedule
 
 
 def make_constant_schedule(warmup_steps: int = 1000):
     """Create a constant schedule function for LambdaLR."""
-
     def schedule(step):
         return constant_with_warmup(step, warmup_steps)
-
     return schedule
 
 
@@ -247,10 +249,13 @@ def _smoke_test():
     print("\n[2] Timestep sampling...")
     t = sample_timesteps(B, device)
     assert t.shape == (B,)
-    assert (t >= 1e-4).all() and (t <= 1 - 1e-4).all()
-    print(f"    logit-normal + shift: {[f'{x:.3f}' for x in t.tolist()]}")
+    assert (t >= 1e-4).all() and (t <= 1-1e-4).all()
+    print(f"    logit-normal (μ=0, σ=1) + shift: {[f'{x:.3f}' for x in t.tolist()]}")
 
-    t_uniform = sample_timesteps_uniform(B, device)
+    t_biased = sample_timesteps(B, device, logit_mean=0.5, logit_std=0.5)
+    print(f"    logit-normal (μ=0.5, σ=0.5): {[f'{x:.3f}' for x in t_biased.tolist()]}")
+
+    t_uniform = sample_timesteps(B, device, logit_normal=False)
     print(f"    uniform: {[f'{x:.3f}' for x in t_uniform.tolist()]}")
 
     t_strat = sample_timesteps_stratified(B, device)

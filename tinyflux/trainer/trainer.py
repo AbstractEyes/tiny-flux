@@ -28,9 +28,10 @@ from dataclasses import dataclass, field
 from tqdm import tqdm
 
 from .losses import compute_main_loss, compute_lune_loss, compute_sol_loss, min_snr_weight
-from .schedules import sample_timesteps, flux_shift, get_lune_weight, get_sol_weight, make_cosine_schedule
+from .schedules import sample_timesteps, get_lune_weight, get_sol_weight, make_cosine_schedule
 from .ema import EMA
 from .cache_experts import MultiSourceCache
+from tinyflux.util.predictions import flow_x_t, flow_velocity
 
 
 @dataclass
@@ -42,13 +43,21 @@ class TrainerConfig:
     weight_decay: float = 0.01
     betas: Tuple[float, float] = (0.9, 0.95)
     grad_clip: float = 1.0
+    optimizer: str = "adamw"  # "adamw", "adamw_8bit", "adafactor"
 
     # Schedule
     warmup_steps: int = 1000
     total_steps: int = 100000
+    lr_scheduler: str = "cosine"  # "cosine", "linear", "constant"
+    min_lr: float = 0.0  # Minimum LR for cosine decay
+    warmup_type: str = "linear"  # "linear", "cosine"
 
     # Batching
     gradient_accumulation: int = 1
+
+    # Memory optimization
+    gradient_checkpointing: bool = False
+    compile_mode: Optional[str] = None  # "reduce-overhead", "max-autotune", None
 
     # EMA
     ema_decay: float = 0.9999
@@ -62,6 +71,11 @@ class TrainerConfig:
     use_huber_loss: bool = False
     huber_delta: float = 0.1
 
+    # Flow matching options
+    logit_normal_sampling: bool = True  # Sample t from logit-normal (vs uniform)
+    logit_mean: float = 0.0  # Mean for logit-normal sampling
+    logit_std: float = 1.0  # Std for logit-normal sampling
+
     # Lune distillation
     enable_lune: bool = True
     lune_weight: float = 0.1
@@ -73,6 +87,7 @@ class TrainerConfig:
     enable_sol: bool = True
     sol_weight: float = 0.05
     sol_warmup_steps: int = 2000
+    sol_dropout: float = 0.1  # Drop teacher attention to force predictor
     use_spatial_weighting: bool = False  # Weight main loss by Sol spatial
 
     # Text dropout
@@ -196,22 +211,30 @@ class Trainer:
         config: TrainerConfig,
         device: str = "cuda",
     ):
-        self.model = model.to(device)
         self.config = config
         self.device = device
 
-        # Optimizer (only trainable params)
+        # Gradient checkpointing
+        if config.gradient_checkpointing:
+            if hasattr(model, 'enable_gradient_checkpointing'):
+                model.enable_gradient_checkpointing()
+            elif hasattr(model, 'gradient_checkpointing_enable'):
+                model.gradient_checkpointing_enable()
+            print("  ✓ Gradient checkpointing enabled")
+
+        self.model = model.to(device)
+
+        # Compile model if requested
+        if config.compile_mode:
+            self.model = torch.compile(self.model, mode=config.compile_mode)
+            print(f"  ✓ Model compiled with mode={config.compile_mode}")
+
+        # Optimizer
         trainable_params = [p for p in model.parameters() if p.requires_grad]
-        self.optimizer = AdamW(
-            trainable_params,
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
-            betas=config.betas,
-        )
+        self.optimizer = self._create_optimizer(trainable_params, config)
 
         # Scheduler
-        schedule_fn = make_cosine_schedule(config.total_steps, config.warmup_steps)
-        self.scheduler = LambdaLR(self.optimizer, schedule_fn)
+        self.scheduler = self._create_scheduler(self.optimizer, config)
 
         # EMA
         self.ema = EMA(model, decay=config.ema_decay)
@@ -249,6 +272,73 @@ class Trainer:
         os.makedirs(config.checkpoint_dir, exist_ok=True)
         if config.sample_prompts:
             os.makedirs(config.sample_dir, exist_ok=True)
+
+    def _create_optimizer(self, params, config: TrainerConfig):
+        """Create optimizer based on config."""
+        if config.optimizer == "adamw":
+            return AdamW(
+                params,
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+                betas=config.betas,
+            )
+        elif config.optimizer == "adamw_8bit":
+            try:
+                import bitsandbytes as bnb
+                return bnb.optim.AdamW8bit(
+                    params,
+                    lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                    betas=config.betas,
+                )
+            except ImportError:
+                print("  ⚠ bitsandbytes not installed, falling back to AdamW")
+                return AdamW(params, lr=config.learning_rate, weight_decay=config.weight_decay, betas=config.betas)
+        elif config.optimizer == "adafactor":
+            from transformers import Adafactor
+            return Adafactor(
+                params,
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+                scale_parameter=False,
+                relative_step=False,
+            )
+        else:
+            raise ValueError(f"Unknown optimizer: {config.optimizer}")
+
+    def _create_scheduler(self, optimizer, config: TrainerConfig):
+        """Create LR scheduler based on config."""
+        total_steps = config.total_steps
+        warmup_steps = config.warmup_steps
+        min_lr_ratio = config.min_lr / config.learning_rate if config.learning_rate > 0 else 0
+
+        if config.lr_scheduler == "cosine":
+            def schedule_fn(step):
+                # Warmup
+                if step < warmup_steps:
+                    if config.warmup_type == "cosine":
+                        return 0.5 * (1 - math.cos(math.pi * step / warmup_steps))
+                    else:  # linear
+                        return step / warmup_steps
+                # Cosine decay to min_lr
+                progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                return min_lr_ratio + (1 - min_lr_ratio) * cosine_decay
+        elif config.lr_scheduler == "linear":
+            def schedule_fn(step):
+                if step < warmup_steps:
+                    return step / warmup_steps
+                progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+                return max(min_lr_ratio, 1 - progress * (1 - min_lr_ratio))
+        elif config.lr_scheduler == "constant":
+            def schedule_fn(step):
+                if step < warmup_steps:
+                    return step / warmup_steps
+                return 1.0
+        else:
+            raise ValueError(f"Unknown lr_scheduler: {config.lr_scheduler}")
+
+        return LambdaLR(optimizer, schedule_fn)
 
     def setup(
         self,
@@ -329,9 +419,10 @@ class Trainer:
         print(f"\nStarting training:")
         print(f"  Total steps: {cfg.total_steps}")
         print(f"  Gradient accumulation: {cfg.gradient_accumulation}")
-        print(f"  Learning rate: {cfg.learning_rate}")
-        print(f"  Lune: {cfg.enable_lune} (weight={cfg.lune_weight}, warmup={cfg.lune_warmup_steps})")
-        print(f"  Sol: {cfg.enable_sol} (weight={cfg.sol_weight}, warmup={cfg.sol_warmup_steps})")
+        print(f"  Learning rate: {cfg.learning_rate} (scheduler={cfg.lr_scheduler}, min_lr={cfg.min_lr})")
+        print(f"  Flow: shift={cfg.shift}, logit_normal={cfg.logit_normal_sampling} (μ={cfg.logit_mean}, σ={cfg.logit_std})")
+        print(f"  Lune: {cfg.enable_lune} (weight={cfg.lune_weight}, warmup={cfg.lune_warmup_steps}, dropout={cfg.lune_dropout})")
+        print(f"  Sol: {cfg.enable_sol} (weight={cfg.sol_weight}, warmup={cfg.sol_warmup_steps}, dropout={cfg.sol_dropout})")
         print(f"  Text dropout: {cfg.text_dropout}")
 
         while self.step < cfg.total_steps:
@@ -473,13 +564,19 @@ class Trainer:
             t5, clip = apply_text_dropout(t5, clip, cfg.text_dropout)
 
         # Sample timesteps
-        t = torch.sigmoid(torch.randn(B, device=self.device))
-        t = flux_shift(t, shift=cfg.shift).to(cfg.dtype).clamp(1e-4, 1 - 1e-4)
+        t = sample_timesteps(
+            B,
+            device=self.device,
+            shift=cfg.shift,
+            logit_normal=cfg.logit_normal_sampling,
+            logit_mean=cfg.logit_mean,
+            logit_std=cfg.logit_std,
+            dtype=cfg.dtype,
+        )
 
-        # Rectified flow interpolation
-        t_exp = t.view(B, 1, 1)
-        x_t = (1 - t_exp) * noise + t_exp * data
-        v_target = data - noise
+        # Rectified flow matching
+        x_t = flow_x_t(data, noise, t)  # x_t = (1-t)*noise + t*data
+        v_target = flow_velocity(data, noise)  # v = data - noise
 
         # Position IDs
         from tinyflux.model.model import TinyFluxDeep
@@ -499,6 +596,10 @@ class Trainer:
 
             if cfg.enable_sol:
                 sol_stats, sol_spatial = self.cache.get_sol(local_indices, dataset_ids, t)
+                # Teacher dropout - forces model to use predictor
+                if sol_stats is not None and random.random() < cfg.sol_dropout:
+                    sol_stats = None
+                    sol_spatial = None
 
         # Forward
         with torch.autocast(self.device, dtype=cfg.dtype):
