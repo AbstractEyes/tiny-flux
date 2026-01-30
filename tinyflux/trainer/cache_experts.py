@@ -119,6 +119,7 @@ class EncodingCache:
         vae_scale: Optional[float] = None,
         checkpoint_dir: Optional[str] = None,
         checkpoint_every: int = 500,
+        show_progress: bool = True,
     ) -> "EncodingCache":
         """
         Build encoding cache from images and prompts.
@@ -128,6 +129,7 @@ class EncodingCache:
         Args:
             checkpoint_dir: If set, save progress every checkpoint_every samples
             checkpoint_every: Save interval (samples)
+            show_progress: Show tqdm progress bar
         """
         device = zoo.device
         n = len(images)
@@ -155,7 +157,7 @@ class EncodingCache:
                 print(f"    Loaded {start_idx}/{n} samples")
 
         with torch.no_grad():
-            for i in tqdm(range(start_idx, n, batch_size), desc="Encoding", initial=start_idx//batch_size, total=(n+batch_size-1)//batch_size):
+            for i in tqdm(range(start_idx, n, batch_size), desc="Encoding", initial=start_idx//batch_size, total=(n+batch_size-1)//batch_size, disable=not show_progress):
                 batch_imgs = images[i:i+batch_size]
                 batch_prompts = prompts[i:i+batch_size]
 
@@ -336,6 +338,7 @@ class LuneFeatureCache:
         batch_timesteps: bool = True,
         checkpoint_dir: Optional[str] = None,
         checkpoint_every: int = 500,
+        show_progress: bool = True,
     ) -> "LuneFeatureCache":
         """
         Extract Lune mid-block features for all prompts at all timestep buckets.
@@ -350,6 +353,7 @@ class LuneFeatureCache:
             batch_timesteps: If True, process all timesteps in one forward (faster, more VRAM)
             checkpoint_dir: If set, save progress every checkpoint_every samples
             checkpoint_every: Save interval (samples)
+            show_progress: Show tqdm progress bar
         """
         device = zoo.device
 
@@ -375,7 +379,8 @@ class LuneFeatureCache:
 
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
             for start in tqdm(range(start_idx, n_prompts, batch_size), desc="Extracting Lune",
-                             initial=start_idx//batch_size, total=(n_prompts+batch_size-1)//batch_size):
+                             initial=start_idx//batch_size, total=(n_prompts+batch_size-1)//batch_size,
+                             disable=not show_progress):
                 end_idx = min(start + batch_size, n_prompts)
                 batch_prompts = prompts[start:end_idx]
                 B = len(batch_prompts)
@@ -565,6 +570,7 @@ class SolFeatureCache:
         batch_timesteps: bool = False,  # Default False - Sol attention is VRAM heavy
         checkpoint_dir: Optional[str] = None,
         checkpoint_every: int = 500,
+        show_progress: bool = True,
     ) -> "SolFeatureCache":
         """
         Extract Sol attention statistics for all prompts at all timestep buckets.
@@ -580,6 +586,7 @@ class SolFeatureCache:
             batch_timesteps: If True, process all timesteps in one forward (faster but 10x VRAM)
             checkpoint_dir: If set, save progress every checkpoint_every samples
             checkpoint_every: Save interval (samples)
+            show_progress: Show tqdm progress bar
         """
         device = zoo.device
 
@@ -607,7 +614,8 @@ class SolFeatureCache:
 
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
             for start in tqdm(range(start_idx, n_prompts, batch_size), desc="Extracting Sol",
-                             initial=start_idx//batch_size, total=(n_prompts+batch_size-1)//batch_size):
+                             initial=start_idx//batch_size, total=(n_prompts+batch_size-1)//batch_size,
+                             disable=not show_progress):
                 end_idx = min(start + batch_size, n_prompts)
                 batch_prompts = prompts[start:end_idx]
                 B = len(batch_prompts)
@@ -1249,7 +1257,7 @@ class DatasetCache:
                     continue
 
                 chunk_images, chunk_prompts = load_chunk(chunk_idx)
-                enc = EncodingCache.build(zoo, chunk_images, chunk_prompts, batch_size, dtype=dtype)
+                enc = EncodingCache.build(zoo, chunk_images, chunk_prompts, batch_size, dtype=dtype, show_progress=False)
                 enc.save(enc_path)
 
                 del enc, chunk_images, chunk_prompts
@@ -1287,6 +1295,7 @@ class DatasetCache:
                         batch_size=batch_size,
                         dtype=dtype,
                         batch_timesteps=True,
+                        show_progress=False,
                     )
                     lune_cache.save(lune_path)
 
@@ -1324,6 +1333,7 @@ class DatasetCache:
                         batch_size=sol_bs,
                         dtype=dtype,
                         batch_timesteps=False,
+                        show_progress=False,
                     )
                     sol_cache.save(sol_path)
 
