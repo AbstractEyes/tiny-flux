@@ -284,7 +284,380 @@ class DoubleStreamLoRA(nn.Module):
 
 
 # =============================================================================
-# Utility
+# Single-Stream LoRA (Prototype 2)
+# =============================================================================
+
+@dataclass
+class SingleStreamLoRAConfig:
+    """Configuration for single-stream LoRA."""
+    rank: int = 16
+    alpha: float = 16.0
+    dropout: float = 0.0
+
+    # Which projections to adapt
+    adapt_qkv: bool = True      # Self-attention QKV
+    adapt_out: bool = True      # Self-attention output
+    adapt_mlp: bool = True      # MLP layers (fc1 + fc2)
+
+    # Which blocks (None = all 25)
+    block_indices: Optional[List[int]] = None
+
+
+class SingleStreamLoRA(nn.Module):
+    """
+    LoRA for TinyFlux single-stream blocks.
+
+    Targets unified self-attention where txt+img are concatenated:
+    - qkv: joint queries/keys/values
+    - out_proj: attention output projection
+    - mlp.fc1/fc2: feed-forward layers
+
+    Single-stream is where final refinement and detail generation happens.
+
+    Usage:
+        lora = SingleStreamLoRA(model, rank=16)
+        optimizer = torch.optim.AdamW(lora.parameters(), lr=1e-4)
+        # ... train ...
+        lora.save("lora.safetensors")
+        lora.merge()  # Zero inference overhead
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        config: Optional[SingleStreamLoRAConfig] = None,
+        rank: int = 16,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+
+        if config is None:
+            config = SingleStreamLoRAConfig(rank=rank, alpha=alpha, dropout=dropout)
+        self.config = config
+
+        if not hasattr(model, 'single_blocks'):
+            raise ValueError("Model must have single_blocks attribute")
+
+        self.adapters: nn.ModuleDict = nn.ModuleDict()
+
+        num_blocks = len(model.single_blocks)
+        block_indices = config.block_indices or list(range(num_blocks))
+
+        # Inject LoRA into each target
+        for idx in block_indices:
+            if idx >= num_blocks:
+                continue
+
+            block = model.single_blocks[idx]
+            attn = block.attn  # Attention (not JointAttention)
+            mlp = block.mlp   # MLP
+
+            # Attention targets
+            if config.adapt_qkv:
+                key = f"block_{idx}_qkv"
+                adapter = LoRALinear(
+                    attn.qkv,
+                    rank=config.rank,
+                    alpha=config.alpha,
+                    dropout=config.dropout,
+                )
+                self.adapters[key] = adapter
+                attn.qkv = adapter
+
+            if config.adapt_out:
+                key = f"block_{idx}_out"
+                adapter = LoRALinear(
+                    attn.out_proj,
+                    rank=config.rank,
+                    alpha=config.alpha,
+                    dropout=config.dropout,
+                )
+                self.adapters[key] = adapter
+                attn.out_proj = adapter
+
+            # MLP targets
+            if config.adapt_mlp:
+                key = f"block_{idx}_mlp_fc1"
+                adapter = LoRALinear(
+                    mlp.fc1,
+                    rank=config.rank,
+                    alpha=config.alpha,
+                    dropout=config.dropout,
+                )
+                self.adapters[key] = adapter
+                mlp.fc1 = adapter
+
+                key = f"block_{idx}_mlp_fc2"
+                adapter = LoRALinear(
+                    mlp.fc2,
+                    rank=config.rank,
+                    alpha=config.alpha,
+                    dropout=config.dropout,
+                )
+                self.adapters[key] = adapter
+                mlp.fc2 = adapter
+
+        # Freeze entire model
+        for param in model.parameters():
+            param.requires_grad = False
+
+        # Unfreeze LoRA params
+        for adapter in self.adapters.values():
+            adapter.lora_A.requires_grad = True
+            adapter.lora_B.requires_grad = True
+
+        self._print_stats(model)
+
+    def _print_stats(self, model: nn.Module):
+        total = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        lora_params = sum(
+            a.lora_A.numel() + a.lora_B.numel()
+            for a in self.adapters.values()
+        )
+
+        print(f"\n[SingleStreamLoRA]")
+        print(f"  Adapters: {len(self.adapters)}")
+        print(f"  Rank: {self.config.rank}, Alpha: {self.config.alpha}")
+        print(f"  LoRA params: {lora_params:,}")
+        print(f"  Trainable: {trainable:,} / {total:,} ({100*trainable/total:.3f}%)")
+
+    def parameters(self):
+        """Yield only LoRA parameters."""
+        for adapter in self.adapters.values():
+            yield adapter.lora_A
+            yield adapter.lora_B
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        """Get LoRA weights only."""
+        state = {}
+        for name, adapter in self.adapters.items():
+            state[f"{name}.lora_A"] = adapter.lora_A.data
+            state[f"{name}.lora_B"] = adapter.lora_B.data
+        return state
+
+    def load_state_dict(self, state: Dict[str, torch.Tensor]):
+        """Load LoRA weights."""
+        for name, adapter in self.adapters.items():
+            a_key = f"{name}.lora_A"
+            b_key = f"{name}.lora_B"
+            if a_key in state:
+                adapter.lora_A.data.copy_(state[a_key])
+            if b_key in state:
+                adapter.lora_B.data.copy_(state[b_key])
+
+    def save(self, path: str, metadata: Optional[Dict[str, str]] = None):
+        """Save LoRA weights."""
+        state = self.state_dict()
+
+        meta = metadata or {}
+        meta.update({
+            'type': 'single_stream_lora',
+            'rank': str(self.config.rank),
+            'alpha': str(self.config.alpha),
+            'num_adapters': str(len(self.adapters)),
+        })
+
+        if path.endswith('.safetensors'):
+            from safetensors.torch import save_file
+            save_file(state, path, metadata=meta)
+        else:
+            torch.save({'state_dict': state, 'metadata': meta}, path)
+
+        size_kb = sum(v.numel() * v.element_size() for v in state.values()) / 1024
+        print(f"Saved: {path} ({size_kb:.1f} KB, {len(state)} tensors)")
+
+    def load(self, path: str):
+        """Load LoRA weights."""
+        if path.endswith('.safetensors'):
+            from safetensors.torch import load_file
+            state = load_file(path)
+        else:
+            data = torch.load(path, map_location='cpu')
+            state = data.get('state_dict', data)
+
+        self.load_state_dict(state)
+        print(f"Loaded: {path}")
+
+    def merge(self):
+        """Merge all LoRA weights into base model."""
+        for adapter in self.adapters.values():
+            adapter.merge()
+        print(f"Merged {len(self.adapters)} adapters")
+
+    def unmerge(self):
+        """Unmerge all LoRA weights from base model."""
+        for adapter in self.adapters.values():
+            adapter.unmerge()
+        print(f"Unmerged {len(self.adapters)} adapters")
+
+    def set_scale(self, scale: float):
+        """Adjust LoRA contribution."""
+        for adapter in self.adapters.values():
+            adapter.scale = scale
+
+
+# =============================================================================
+# Combined LoRA (Double + Single)
+# =============================================================================
+
+@dataclass
+class CombinedLoRAConfig:
+    """Configuration for combined double+single stream LoRA."""
+    rank: int = 16
+    alpha: float = 16.0
+    dropout: float = 0.0
+
+    # Double-stream
+    adapt_double: bool = True
+    double_block_indices: Optional[List[int]] = None
+
+    # Single-stream
+    adapt_single: bool = True
+    single_block_indices: Optional[List[int]] = None
+    adapt_mlp: bool = True  # Include MLP in single-stream
+
+
+class CombinedLoRA(nn.Module):
+    """
+    Combined LoRA for both double-stream and single-stream blocks.
+
+    This is the full LoRA covering:
+    - Double-stream: txt↔img cross-attention (concept binding)
+    - Single-stream: unified self-attention + MLP (refinement)
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        config: Optional[CombinedLoRAConfig] = None,
+        rank: int = 16,
+        alpha: float = 16.0,
+    ):
+        super().__init__()
+
+        if config is None:
+            config = CombinedLoRAConfig(rank=rank, alpha=alpha)
+        self.config = config
+
+        self.double_lora = None
+        self.single_lora = None
+
+        if config.adapt_double:
+            double_config = DoubleStreamLoRAConfig(
+                rank=config.rank,
+                alpha=config.alpha,
+                dropout=config.dropout,
+                block_indices=config.double_block_indices,
+            )
+            self.double_lora = DoubleStreamLoRA(model, config=double_config)
+
+        if config.adapt_single:
+            single_config = SingleStreamLoRAConfig(
+                rank=config.rank,
+                alpha=config.alpha,
+                dropout=config.dropout,
+                adapt_mlp=config.adapt_mlp,
+                block_indices=config.single_block_indices,
+            )
+            self.single_lora = SingleStreamLoRA(model, config=single_config)
+
+        self._print_combined_stats(model)
+
+    def _print_combined_stats(self, model: nn.Module):
+        total = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        print(f"\n[CombinedLoRA]")
+        print(f"  Total trainable: {trainable:,} / {total:,} ({100*trainable/total:.3f}%)")
+
+    def parameters(self):
+        """Yield all LoRA parameters."""
+        if self.double_lora:
+            yield from self.double_lora.parameters()
+        if self.single_lora:
+            yield from self.single_lora.parameters()
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        """Get all LoRA weights."""
+        state = {}
+        if self.double_lora:
+            for k, v in self.double_lora.state_dict().items():
+                state[f"double.{k}"] = v
+        if self.single_lora:
+            for k, v in self.single_lora.state_dict().items():
+                state[f"single.{k}"] = v
+        return state
+
+    def load_state_dict(self, state: Dict[str, torch.Tensor]):
+        """Load all LoRA weights."""
+        double_state = {k[7:]: v for k, v in state.items() if k.startswith("double.")}
+        single_state = {k[7:]: v for k, v in state.items() if k.startswith("single.")}
+
+        if self.double_lora and double_state:
+            self.double_lora.load_state_dict(double_state)
+        if self.single_lora and single_state:
+            self.single_lora.load_state_dict(single_state)
+
+    def save(self, path: str, metadata: Optional[Dict[str, str]] = None):
+        """Save all LoRA weights."""
+        state = self.state_dict()
+
+        meta = metadata or {}
+        meta.update({
+            'type': 'combined_lora',
+            'rank': str(self.config.rank),
+            'alpha': str(self.config.alpha),
+            'has_double': str(self.double_lora is not None),
+            'has_single': str(self.single_lora is not None),
+        })
+
+        if path.endswith('.safetensors'):
+            from safetensors.torch import save_file
+            save_file(state, path, metadata=meta)
+        else:
+            torch.save({'state_dict': state, 'metadata': meta}, path)
+
+        size_kb = sum(v.numel() * v.element_size() for v in state.values()) / 1024
+        print(f"Saved: {path} ({size_kb:.1f} KB, {len(state)} tensors)")
+
+    def load(self, path: str):
+        """Load all LoRA weights."""
+        if path.endswith('.safetensors'):
+            from safetensors.torch import load_file
+            state = load_file(path)
+        else:
+            data = torch.load(path, map_location='cpu')
+            state = data.get('state_dict', data)
+
+        self.load_state_dict(state)
+        print(f"Loaded: {path}")
+
+    def merge(self):
+        """Merge all LoRA weights into base model."""
+        if self.double_lora:
+            self.double_lora.merge()
+        if self.single_lora:
+            self.single_lora.merge()
+
+    def unmerge(self):
+        """Unmerge all LoRA weights from base model."""
+        if self.double_lora:
+            self.double_lora.unmerge()
+        if self.single_lora:
+            self.single_lora.unmerge()
+
+    def set_scale(self, scale: float):
+        """Adjust LoRA contribution."""
+        if self.double_lora:
+            self.double_lora.set_scale(scale)
+        if self.single_lora:
+            self.single_lora.set_scale(scale)
+
+
+# =============================================================================
+# Utility Functions
 # =============================================================================
 
 def calculate_double_lora_size(
@@ -313,6 +686,73 @@ def calculate_double_lora_size(
         'per_qkv': txt_qkv_lora,
         'per_out': txt_out_lora,
         'per_block': per_block,
+        'total': total,
+        'total_kb': total * 4 / 1024,
+        'total_mb': total * 4 / 1024 / 1024,
+    }
+
+
+def calculate_single_lora_size(
+    hidden_size: int = 512,
+    num_heads: int = 4,
+    head_dim: int = 128,
+    mlp_ratio: float = 4.0,
+    num_blocks: int = 25,
+    rank: int = 16,
+    include_mlp: bool = True,
+) -> Dict[str, int]:
+    """Calculate LoRA parameter count for single-stream."""
+    # Attention
+    qkv_in = hidden_size
+    qkv_out = 3 * num_heads * head_dim  # 1536
+    out_in = num_heads * head_dim        # 512
+    out_out = hidden_size                # 512
+
+    qkv_lora = rank * (qkv_in + qkv_out)
+    out_lora = rank * (out_in + out_out)
+
+    # MLP
+    mlp_hidden = int(hidden_size * mlp_ratio)
+    fc1_lora = rank * (hidden_size + mlp_hidden) if include_mlp else 0
+    fc2_lora = rank * (mlp_hidden + hidden_size) if include_mlp else 0
+
+    per_block = qkv_lora + out_lora + fc1_lora + fc2_lora
+    total = per_block * num_blocks
+
+    return {
+        'per_qkv': qkv_lora,
+        'per_out': out_lora,
+        'per_mlp': fc1_lora + fc2_lora,
+        'per_block': per_block,
+        'total': total,
+        'total_kb': total * 4 / 1024,
+        'total_mb': total * 4 / 1024 / 1024,
+    }
+
+
+def calculate_combined_lora_size(
+    hidden_size: int = 512,
+    num_heads: int = 4,
+    head_dim: int = 128,
+    mlp_ratio: float = 4.0,
+    num_double_blocks: int = 15,
+    num_single_blocks: int = 25,
+    rank: int = 16,
+    include_mlp: bool = True,
+) -> Dict[str, int]:
+    """Calculate LoRA parameter count for combined double+single."""
+    double = calculate_double_lora_size(
+        hidden_size, num_heads, head_dim, num_double_blocks, rank
+    )
+    single = calculate_single_lora_size(
+        hidden_size, num_heads, head_dim, mlp_ratio, num_single_blocks, rank, include_mlp
+    )
+
+    total = double['total'] + single['total']
+
+    return {
+        'double_total': double['total'],
+        'single_total': single['total'],
         'total': total,
         'total_kb': total * 4 / 1024,
         'total_mb': total * 4 / 1024 / 1024,

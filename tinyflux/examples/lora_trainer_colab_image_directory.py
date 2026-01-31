@@ -49,41 +49,45 @@ class LoRAConfig:
     # Dataset inflation
     repeats: int = 100  # Repeat each image N times per epoch
 
-    # LoRA
+    # LoRA type and parameters
+    lora_type: str = "single"  # "double", "single", or "combined"
     rank: int = 16
     alpha: float = 16.0
+    adapt_mlp: bool = True  # For single/combined: include MLP layers
 
-    # Training
-    steps: int = 1000
+    # Training (epoch-based)
+    epochs: int = 10  # Number of epochs to train
     batch_size: int = 1
     lr: float = 1e-4
-    warmup_steps: int = 50
+    warmup_epochs: float = 0.5  # Warmup for first half epoch
+    train_resolution: int = 512  # 512 for A100, 256 for T4
 
     # Checkpoints
-    save_every: int = 250  # Save checkpoint every N steps
+    save_every_epoch: int = 1  # Save checkpoint every N epochs
 
     # HuggingFace upload
-    hf_repo: Optional[str] = None  # e.g., "AbstractPhil/tiny-flux-lora"
-    hf_subdir: str = "lora_v1"     # Subdirectory in repo
-    upload_every: int = 500        # Upload checkpoint every N steps
+    hf_repo: Optional[str] = "AbstractPhil/tinyflux-lailah-loras"
+    hf_subdir: str = "lora_v1_man_wearing_brown_cap"
+    upload_every_epoch: int = 2  # Upload checkpoint every N epochs
 
     # Sampling
     sample_prompts: List[str] = field(default_factory=lambda: [
         "a red cube on a blue sphere",
         "a cat sitting on a table",
+        "A man wearing a brown cap looking sitting at his computer with a black and brown dog resting next to him on the couch."
     ])
     sample_every_epoch: bool = True
-    sample_steps: int = 20
-    sample_cfg: float = 4.0
+    sample_steps: int = 50
+    sample_cfg: float = 7.5
     sample_seed: int = 42
 
     # Experts
-    build_lune: bool = True
-    build_sol: bool = True
+    build_lune: bool = False
+    build_sol: bool = False
 
     # Base model
     base_repo: str = "AbstractPhil/tiny-flux-deep"
-    base_weights: str = "checkpoint_runs/v4_init/lailah_401434_v4_init.safetensors"
+    base_weights: str = "step_417054.pt"
 
 
 def upload_to_hf(
@@ -137,9 +141,19 @@ def train_lora(config: Optional[LoRAConfig] = None, **kwargs):
     print(f"Device: {device}")
     print(f"Data: {config.data_dir}")
     print(f"Repeats: {config.repeats}")
-    print(f"Steps: {config.steps}, Rank: {config.rank}, LR: {config.lr}")
+    print(f"LoRA type: {config.lora_type}")
+    print(f"Epochs: {config.epochs}, Rank: {config.rank}, LR: {config.lr}")
+    print(f"Train resolution: {config.train_resolution}x{config.train_resolution}")
+
+    # Memory estimate
+    latent_size = config.train_resolution // 8
+    tokens = latent_size * latent_size
+    print(f"  Latent: {latent_size}x{latent_size} = {tokens} tokens")
+    if tokens > 2048:
+        print(f"  ⚠️  Warning: {tokens} tokens may OOM on T4. Try train_resolution=256")
+
     if config.hf_repo:
-        print(f"HF Upload: {config.hf_repo}/{config.hf_subdir} every {config.upload_every} steps")
+        print(f"HF Upload: {config.hf_repo}/{config.hf_subdir} every {config.upload_every_epoch} epochs")
 
     os.makedirs(config.output_dir, exist_ok=True)
     cache_dir = os.path.join(config.output_dir, "cache")
@@ -160,12 +174,7 @@ def train_lora(config: Optional[LoRAConfig] = None, **kwargs):
     images, prompts = raw_dataset.get_images_and_prompts()
     n_images = len(images)
 
-    # Calculate epoch size
-    epoch_size = n_images * config.repeats
-    steps_per_epoch = epoch_size // config.batch_size
-
-    print(f"  {n_images} images × {config.repeats} repeats = {epoch_size} samples/epoch")
-    print(f"  ~{steps_per_epoch} steps/epoch")
+    print(f"  Found {n_images} images")
 
     # =========================================================================
     # 2. Build cache
@@ -199,8 +208,11 @@ def train_lora(config: Optional[LoRAConfig] = None, **kwargs):
 
     print(f"  Cache: {len(cache)} samples")
 
-    # Free cache-building memory
+    # Free cache-building memory - unload ALL models
     del images, raw_dataset
+    zoo.unload("vae")
+    zoo.unload("t5")
+    zoo.unload("clip")
     zoo.unload("lune")
     zoo.unload("sol")
     torch.cuda.empty_cache()
@@ -210,7 +222,11 @@ def train_lora(config: Optional[LoRAConfig] = None, **kwargs):
     # =========================================================================
     print("\n[3/6] Loading model...")
 
-    from tinyflux.model.lora import DoubleStreamLoRA, DoubleStreamLoRAConfig
+    from tinyflux.model.lora import (
+        DoubleStreamLoRA, DoubleStreamLoRAConfig,
+        SingleStreamLoRA, SingleStreamLoRAConfig,
+        CombinedLoRA, CombinedLoRAConfig,
+    )
 
     model = zoo.load_tinyflux(
         source=config.base_repo,
@@ -218,41 +234,121 @@ def train_lora(config: Optional[LoRAConfig] = None, **kwargs):
         train_mode=True,
     )
 
-    print("\n[4/6] Injecting LoRA...")
+    # Memory optimizations for T4/Colab
+    # Enable memory efficient attention
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    print("  Memory-efficient attention enabled")
 
-    lora_config = DoubleStreamLoRAConfig(
-        rank=config.rank,
-        alpha=config.alpha,
-    )
-    lora = DoubleStreamLoRA(model, config=lora_config)
+    print(f"\n[4/6] Injecting LoRA ({config.lora_type})...")
+
+    # Create appropriate LoRA based on type
+    if config.lora_type == "double":
+        lora_cfg = DoubleStreamLoRAConfig(
+            rank=config.rank,
+            alpha=config.alpha,
+        )
+        lora = DoubleStreamLoRA(model, config=lora_cfg)
+    elif config.lora_type == "single":
+        lora_cfg = SingleStreamLoRAConfig(
+            rank=config.rank,
+            alpha=config.alpha,
+            adapt_mlp=config.adapt_mlp,
+        )
+        lora = SingleStreamLoRA(model, config=lora_cfg)
+    elif config.lora_type == "combined":
+        lora_cfg = CombinedLoRAConfig(
+            rank=config.rank,
+            alpha=config.alpha,
+            adapt_mlp=config.adapt_mlp,
+        )
+        lora = CombinedLoRA(model, config=lora_cfg)
+    else:
+        raise ValueError(f"Unknown lora_type: {config.lora_type}. Use 'double', 'single', or 'combined'")
 
     # =========================================================================
-    # 4. Setup sampler
+    # 4. Setup sampler (lazy - will load encoders only when sampling)
     # =========================================================================
     print("\n[5/6] Setting up sampler...")
 
     from tinyflux.trainer.sampling import Sampler, save_samples
 
-    # Keep VAE/T5/CLIP loaded for sampling
-    if zoo.vae is None:
-        zoo.load_vae()
-    if zoo.t5 is None:
-        zoo.load_t5()
-    # CLIP should already be loaded
+    # Don't load encoders yet - will load on demand for sampling
+    # This saves ~3GB VRAM during training
+    sampler = None  # Created lazily
 
-    sampler = Sampler(
-        zoo=zoo,
-        model=model,
-        ema=None,  # No EMA for LoRA
-        num_steps=config.sample_steps,
-        guidance_scale=config.sample_cfg,
-        shift=3.0,
-        device=device,
-        dtype=dtype,
-    )
+    def do_sample(epoch_num: int) -> Optional[str]:
+        """Generate and save samples, loading encoders as needed."""
+        nonlocal sampler
+
+        if not config.sample_prompts:
+            return None
+
+        # Ensure encoders are loaded and on GPU
+        if zoo.vae is None:
+            zoo.load_vae()
+        else:
+            zoo.onload("vae")
+
+        if zoo.t5 is None:
+            zoo.load_t5()
+        else:
+            zoo.onload("t5")
+
+        if zoo.clip is None:
+            zoo.load_clip()
+        else:
+            zoo.onload("clip")
+
+        # Create sampler if needed
+        if sampler is None:
+            print("  Initializing sampler...")
+            sampler = Sampler(
+                zoo=zoo,
+                model=model,
+                ema=None,
+                num_steps=config.sample_steps,
+                guidance_scale=config.sample_cfg,
+                shift=3.0,
+                device=device,
+                dtype=dtype,
+            )
+
+        model.eval()
+        with torch.no_grad():
+            sample_images = sampler.generate(
+                config.sample_prompts,
+                seed=config.sample_seed,
+            )
+            sample_path = save_samples(
+                sample_images,
+                config.sample_prompts,
+                epoch_num,
+                samples_dir,
+            )
+            print(f"  Saved: {sample_path}")
+
+            if config.hf_repo:
+                upload_to_hf(
+                    sample_path,
+                    config.hf_repo,
+                    f"{config.hf_subdir}/samples",
+                )
+
+        model.train()
+
+        # On A100 (40GB+), don't offload - plenty of VRAM
+        # Only offload on smaller GPUs to fit training
+        if torch.cuda.get_device_properties(0).total_memory < 20e9:
+            zoo.offload("vae")
+            zoo.offload("t5")
+            zoo.offload("clip")
+            torch.cuda.empty_cache()
+
+        return sample_path
 
     # =========================================================================
-    # 5. Training loop
+    # 5. Training loop (epoch-based)
     # =========================================================================
     print("\n[6/6] Training...")
 
@@ -267,29 +363,35 @@ def train_lora(config: Optional[LoRAConfig] = None, **kwargs):
         shuffle=True,
     )
 
+    # Calculate training metrics
+    steps_per_epoch = len(loader)
+    total_steps = steps_per_epoch * config.epochs
+    warmup_steps = int(config.warmup_epochs * steps_per_epoch)
+
+    print(f"  {n_images} images × {config.repeats} repeats = {steps_per_epoch} steps/epoch")
+    print(f"  {config.epochs} epochs = {total_steps} total steps")
+    print(f"  Warmup: {warmup_steps} steps ({config.warmup_epochs} epochs)")
+
     optimizer = torch.optim.AdamW(lora.parameters(), lr=config.lr, weight_decay=0.01)
 
     def lr_lambda(step):
-        if step < config.warmup_steps:
-            return step / config.warmup_steps
+        if step < warmup_steps:
+            return step / warmup_steps
         return 1.0
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     model.train()
-    step = 0
-    epoch = 0
+    global_step = 0
     running_loss = 0.0
+    log_every = max(1, steps_per_epoch // 10)  # Log ~10 times per epoch
 
-    pbar = tqdm(total=config.steps, desc="Training LoRA")
+    for epoch in range(1, config.epochs + 1):
+        epoch_loss = 0.0
+        epoch_steps = 0
 
-    while step < config.steps:
-        epoch += 1
-        epoch_start_step = step
+        pbar = tqdm(loader, desc=f"Epoch {epoch}/{config.epochs}")
 
-        for batch in loader:
-            if step >= config.steps:
-                break
-
+        for batch in pbar:
             indices = batch['index']
             B = len(indices)
 
@@ -299,10 +401,20 @@ def train_lora(config: Optional[LoRAConfig] = None, **kwargs):
             t5_embed = t5_embed.to(device, dtype=dtype)
             clip_embed = clip_embed.to(device, dtype=dtype)
 
+            # Resize latents if training at different resolution
+            target_latent_size = config.train_resolution // 8
+            if latents.shape[-1] != target_latent_size:
+                latents = torch.nn.functional.interpolate(
+                    latents,
+                    size=(target_latent_size, target_latent_size),
+                    mode='bilinear',
+                    align_corners=False,
+                )
+
             H = W = latents.shape[-1]
 
             # Sample timesteps
-            t = sample_timesteps(B, device, dtype, shift=3.0)
+            t = sample_timesteps(B, device=device, dtype=dtype, shift=3.0)
 
             # Get expert features
             lune_features = cache.get_lune(indices, t)
@@ -349,61 +461,41 @@ def train_lora(config: Optional[LoRAConfig] = None, **kwargs):
             scheduler.step()
 
             # Logging
-            running_loss += loss.item()
-            step += 1
+            loss_val = loss.item()
+            running_loss += loss_val
+            epoch_loss += loss_val
+            global_step += 1
+            epoch_steps += 1
 
-            if step % 10 == 0:
-                avg_loss = running_loss / 10
+            if global_step % log_every == 0:
+                avg_loss = running_loss / log_every
                 pbar.set_postfix(
                     loss=f"{avg_loss:.4f}",
                     lr=f"{scheduler.get_last_lr()[0]:.2e}",
-                    epoch=epoch,
                 )
                 running_loss = 0.0
 
-            # Local checkpoint
-            if step % config.save_every == 0:
-                ckpt_path = os.path.join(config.output_dir, f"lora_step_{step}.safetensors")
+        # End of epoch
+        avg_epoch_loss = epoch_loss / epoch_steps
+        print(f"  Epoch {epoch} complete | Loss: {avg_epoch_loss:.4f}")
+
+        # Checkpoint every N epochs
+        if epoch % config.save_every_epoch == 0:
+            ckpt_path = os.path.join(config.output_dir, f"lora_epoch_{epoch}.safetensors")
+            lora.save(ckpt_path)
+            print(f"  Saved: {ckpt_path}")
+
+        # Upload every N epochs
+        if config.hf_repo and epoch % config.upload_every_epoch == 0:
+            ckpt_path = os.path.join(config.output_dir, f"lora_epoch_{epoch}.safetensors")
+            if not os.path.exists(ckpt_path):
                 lora.save(ckpt_path)
+            upload_to_hf(ckpt_path, config.hf_repo, config.hf_subdir)
 
-            # HuggingFace upload
-            if config.hf_repo and step % config.upload_every == 0:
-                ckpt_path = os.path.join(config.output_dir, f"lora_step_{step}.safetensors")
-                if not os.path.exists(ckpt_path):
-                    lora.save(ckpt_path)
-                upload_to_hf(ckpt_path, config.hf_repo, config.hf_subdir)
-
-            pbar.update(1)
-
-        # End of epoch: sample
+        # Sample every epoch
         if config.sample_every_epoch and config.sample_prompts:
-            print(f"\n  [Epoch {epoch}] Generating samples...")
-            model.eval()
-
-            with torch.no_grad():
-                sample_images = sampler.generate(
-                    config.sample_prompts,
-                    seed=config.sample_seed,
-                )
-                sample_path = save_samples(
-                    sample_images,
-                    config.sample_prompts,
-                    step,
-                    samples_dir,
-                )
-                print(f"  Saved: {sample_path}")
-
-                # Upload sample to HF
-                if config.hf_repo:
-                    upload_to_hf(
-                        sample_path,
-                        config.hf_repo,
-                        f"{config.hf_subdir}/samples",
-                    )
-
-            model.train()
-
-    pbar.close()
+            print(f"  Generating samples...")
+            do_sample(epoch)
 
     # Final save
     final_path = os.path.join(config.output_dir, "lora_final.safetensors")
@@ -416,16 +508,12 @@ def train_lora(config: Optional[LoRAConfig] = None, **kwargs):
     # Final sample
     if config.sample_prompts:
         print("\nGenerating final samples...")
-        model.eval()
-        with torch.no_grad():
-            final_images = sampler.generate(config.sample_prompts, seed=config.sample_seed)
-            final_sample_path = save_samples(final_images, config.sample_prompts, step, samples_dir)
-            print(f"  Saved: {final_sample_path}")
-            if config.hf_repo:
-                upload_to_hf(final_sample_path, config.hf_repo, f"{config.hf_subdir}/samples")
+        do_sample(config.epochs)
 
     print("\n" + "=" * 60)
     print("Training complete!")
+    print(f"  Epochs: {config.epochs}")
+    print(f"  Total steps: {total_steps}")
     print(f"  Final LoRA: {final_path}")
     if config.hf_repo:
         print(f"  HF Repo: https://huggingface.co/{config.hf_repo}/tree/main/{config.hf_subdir}")
@@ -448,32 +536,37 @@ drive.mount('/content/drive')
 
 # Cell 2: Login to HuggingFace (for uploads)
 from huggingface_hub import login
-login()
+from google.colab import userdata
+login(userdata.get("HF_TOKEN"))
 
 # Cell 3: Train!
 from tinyflux.examples.train_lora_colab import train_lora, LoRAConfig
 
 config = LoRAConfig(
     # Data
-    data_dir="/content/drive/MyDrive/lora_dataset",
+    data_dir="/content/drive/MyDrive/test_1024",
     output_dir="/content/lora_output",
-    repeats=100,
+    repeats=100,  # 10 images × 100 repeats = 1000 steps/epoch
     
-    # Training
-    steps=1000,
+    # LoRA type: "double", "single", or "combined"
+    lora_type="single",  # single-stream for detail refinement
+    
+    # Training (epoch-based)
+    epochs=10,
     rank=16,
     batch_size=1,
     lr=1e-4,
+    train_resolution=512,  # 512 for A100, 256 for T4
     
     # HuggingFace
-    hf_repo="YourUsername/tiny-flux-lora",  # Your repo
-    hf_subdir="my_character_v1",            # Subdirectory for this LoRA
-    upload_every=500,
+    hf_repo="AbstractPhil/tinyflux-lailah-loras",
+    hf_subdir="my_character_single_v1",
+    upload_every_epoch=2,
     
     # Sampling
     sample_prompts=[
         "a red cube on a blue sphere",
-        "your custom prompt here",
+        "A man wearing a brown cap sitting at his computer with a black and brown dog resting next to him on the couch.",
     ],
     sample_every_epoch=True,
 )
@@ -482,5 +575,17 @@ model, lora = train_lora(config)
 """
 
 if __name__ == "__main__":
-    print("Colab setup:\n")
-    print(COLAB_SETUP)
+    from huggingface_hub import login
+    from google.colab import userdata
+    login(userdata.get("HF_TOKEN"))
+
+    config = LoRAConfig(
+        data_dir="/content/drive/MyDrive/test_1024",
+        output_dir="/content/lora_output",
+        repeats=100,
+        epochs=10,
+        lora_type="single",  # "double", "single", or "combined"
+        train_resolution=512,
+    )
+
+    model, lora = train_lora(config)
