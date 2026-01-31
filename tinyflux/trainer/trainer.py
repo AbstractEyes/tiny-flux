@@ -117,6 +117,7 @@ class TrainerConfig:
 
     # HuggingFace upload
     hf_repo_id: Optional[str] = None  # e.g. "AbstractPhil/tinyflux-deep"
+    hf_run_name: Optional[str] = None  # Subfolder in repo, e.g. "v4_50k" -> checkpoint_runs/v4_50k/
     upload_every_steps: int = 0  # 0 to disable step uploads
     upload_every_epochs: int = 0  # 0 to disable epoch uploads
 
@@ -739,6 +740,11 @@ class Trainer:
         path = os.path.join(cfg.checkpoint_dir, f'{name}.pt')
         torch.save(checkpoint, path)
 
+        # Save model weights as safetensors (for easy loading)
+        model_safetensors_path = os.path.join(cfg.checkpoint_dir, f'{name}.safetensors')
+        from safetensors.torch import save_file
+        save_file(model_state, model_safetensors_path)
+
         # Save EMA weights as safetensors
         ema_path = os.path.join(cfg.checkpoint_dir, f'{name}_ema.safetensors')
         self.ema.save(ema_path)
@@ -781,18 +787,29 @@ class Trainer:
             old_path = os.path.join(cfg.checkpoint_dir, old)
             os.remove(old_path)
 
+            # Also model safetensors
+            model_st_path = old_path.replace('.pt', '.safetensors')
+            if os.path.exists(model_st_path):
+                os.remove(model_st_path)
+
             # Also EMA
             ema_path = old_path.replace('.pt', '_ema.safetensors')
             if os.path.exists(ema_path):
                 os.remove(ema_path)
 
-    def _upload_to_hf(self, files: Optional[List[str]] = None, commit_message: Optional[str] = None):
+    def _upload_to_hf(
+        self,
+        files: Optional[List[str]] = None,
+        commit_message: Optional[str] = None,
+        path_in_repo: Optional[str] = None,
+    ):
         """
         Upload files to HuggingFace.
 
         Args:
             files: List of file paths to upload (or upload whole checkpoint_dir)
             commit_message: Commit message
+            path_in_repo: Subfolder in repo to upload to
         """
         cfg = self.config
 
@@ -806,21 +823,30 @@ class Trainer:
             if files:
                 for file_path in files:
                     if os.path.exists(file_path):
+                        # Build path in repo
+                        filename = os.path.basename(file_path)
+                        if path_in_repo:
+                            repo_path = f"{path_in_repo}/{filename}"
+                        else:
+                            repo_path = filename
+
                         api.upload_file(
                             path_or_fileobj=file_path,
-                            path_in_repo=os.path.basename(file_path),
+                            path_in_repo=repo_path,
                             repo_id=cfg.hf_repo_id,
-                            commit_message=commit_message or f"Upload {os.path.basename(file_path)}",
+                            commit_message=commit_message or f"Upload {filename}",
                         )
             else:
                 # Upload entire checkpoint directory
                 api.upload_folder(
                     folder_path=cfg.checkpoint_dir,
+                    path_in_repo=path_in_repo or "",
                     repo_id=cfg.hf_repo_id,
                     commit_message=commit_message or f"Training step {self.step}",
                 )
 
-            print(f"  ✓ Uploaded to {cfg.hf_repo_id}")
+            dest = f"{cfg.hf_repo_id}/{path_in_repo}" if path_in_repo else cfg.hf_repo_id
+            print(f"  ✓ Uploaded to {dest}")
         except Exception as e:
             print(f"  ✗ HF upload failed: {e}")
 
@@ -832,21 +858,34 @@ class Trainer:
             print("  ✗ No hf_repo_id configured")
             return
 
-        files = [checkpoint_path]
+        # Collect files to upload
+        files_to_upload = []
 
-        # Also upload EMA
+        # Main checkpoint .pt
+        if os.path.exists(checkpoint_path):
+            files_to_upload.append(checkpoint_path)
+
+        # Model weights .safetensors
+        model_st_path = checkpoint_path.replace('.pt', '.safetensors')
+        if os.path.exists(model_st_path):
+            files_to_upload.append(model_st_path)
+
+        # EMA weights .safetensors
         ema_path = checkpoint_path.replace('.pt', '_ema.safetensors')
         if os.path.exists(ema_path):
-            files.append(ema_path)
+            files_to_upload.append(ema_path)
 
         # Also upload configs
         config_files = ['config.json', 'training_config.json']
         for cf in config_files:
             cf_path = os.path.join(cfg.checkpoint_dir, cf)
             if os.path.exists(cf_path):
-                files.append(cf_path)
+                files_to_upload.append(cf_path)
 
-        self._upload_to_hf(files, f"Checkpoint step {self.step}")
+        # Determine path in repo
+        run_folder = f"checkpoint_runs/{cfg.hf_run_name}" if cfg.hf_run_name else "checkpoint_runs"
+
+        self._upload_to_hf(files_to_upload, f"Checkpoint step {self.step}", path_in_repo=run_folder)
 
     def upload_samples(self):
         """Upload samples directory to HuggingFace."""
