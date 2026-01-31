@@ -29,11 +29,11 @@ class LoRALinear(nn.Module):
     """
 
     def __init__(
-            self,
-            base: nn.Linear,
-            rank: int,
-            alpha: float,
-            dropout: float = 0.0,
+        self,
+        base: nn.Linear,
+        rank: int,
+        alpha: float,
+        dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -48,9 +48,13 @@ class LoRALinear(nn.Module):
         if self.base.bias is not None:
             self.base.bias.requires_grad = False
 
-        # LoRA matrices
-        self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features))
-        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank))
+        # Get device and dtype from base layer
+        device = base.weight.device
+        dtype = base.weight.dtype
+
+        # LoRA matrices - create on same device as base
+        self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features, device=device, dtype=dtype))
+        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, device=device, dtype=dtype))
 
         # Init A with kaiming, B with zeros
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
@@ -65,8 +69,10 @@ class LoRALinear(nn.Module):
             return base_out
 
         # LoRA path: x @ A^T @ B^T * scale
-        lora_out = self.dropout(x) @ self.lora_A.T @ self.lora_B.T
-        return base_out + lora_out * self.scale
+        # Cast to lora dtype for computation, then back to input dtype
+        x_lora = self.dropout(x).to(self.lora_A.dtype)
+        lora_out = x_lora @ self.lora_A.T @ self.lora_B.T
+        return base_out + lora_out.to(base_out.dtype) * self.scale
 
     def merge(self):
         """Merge LoRA into base weights."""
@@ -127,12 +133,12 @@ class DoubleStreamLoRA(nn.Module):
     """
 
     def __init__(
-            self,
-            model: nn.Module,
-            config: Optional[DoubleStreamLoRAConfig] = None,
-            rank: int = 16,
-            alpha: float = 16.0,
-            dropout: float = 0.0,
+        self,
+        model: nn.Module,
+        config: Optional[DoubleStreamLoRAConfig] = None,
+        rank: int = 16,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
     ):
         super().__init__()
 
@@ -200,7 +206,7 @@ class DoubleStreamLoRA(nn.Module):
         print(f"  Adapters: {len(self.adapters)}")
         print(f"  Rank: {self.config.rank}, Alpha: {self.config.alpha}")
         print(f"  LoRA params: {lora_params:,}")
-        print(f"  Trainable: {trainable:,} / {total:,} ({100 * trainable / total:.3f}%)")
+        print(f"  Trainable: {trainable:,} / {total:,} ({100*trainable/total:.3f}%)")
 
     def parameters(self):
         """Yield only LoRA parameters."""
@@ -282,17 +288,17 @@ class DoubleStreamLoRA(nn.Module):
 # =============================================================================
 
 def calculate_double_lora_size(
-        hidden_size: int = 512,
-        num_heads: int = 4,
-        head_dim: int = 128,
-        num_blocks: int = 15,
-        rank: int = 16,
+    hidden_size: int = 512,
+    num_heads: int = 4,
+    head_dim: int = 128,
+    num_blocks: int = 15,
+    rank: int = 16,
 ) -> Dict[str, int]:
     """Calculate LoRA parameter count for double-stream."""
     qkv_in = hidden_size
     qkv_out = 3 * num_heads * head_dim  # 1536
-    out_in = num_heads * head_dim  # 512
-    out_out = hidden_size  # 512
+    out_in = num_heads * head_dim        # 512
+    out_out = hidden_size                # 512
 
     # LoRA params per layer: rank * (in + out)
     txt_qkv_lora = rank * (qkv_in + qkv_out)
