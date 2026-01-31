@@ -1,64 +1,91 @@
 """
-TinyFlux LoRA Modules
+TinyFlux LoRA Module
 
-Low-rank adaptation for TinyFlux model components.
+Flexible low-rank adaptation with per-layer configuration.
 
-Prototype 1: DoubleStreamLoRA
-- Targets JointAttention in double-stream blocks (txt↔img cross-attention)
-- Where concept binding happens
+Usage:
+    from tinyflux.model.lora import TinyFluxLoRA
+    from tinyflux.model.lora_config import TinyFluxLoRAConfig
+
+    # From preset
+    lora = TinyFluxLoRA.from_preset(model, "character")
+
+    # From config
+    config = TinyFluxLoRAConfig.load("my_config.json")
+    lora = TinyFluxLoRA(model, config)
+
+    # Quick usage
+    lora = TinyFluxLoRA(model, rank=16, include_single_attn=True)
 """
 
 import torch
 import torch.nn as nn
 import math
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Iterator, Any, Tuple
+
+from .lora_config import (
+    TinyFluxLoRAConfig,
+    LoRALayerSpec,
+    LoRADefaults,
+    LoRATarget,
+    BlockExtensions,
+    resolve_layer,
+    set_layer,
+    get_tinyflux_layer_paths,
+)
 
 
 # =============================================================================
-# Core LoRA Layer
+# Stacked LoRA Linear
 # =============================================================================
 
-class LoRALinear(nn.Module):
+class StackedLoRALinear(nn.Module):
     """
-    LoRA adapter wrapping a Linear layer.
+    LoRA adapter with support for stacking (depth > 1).
 
-    y = Wx + (BA)x * scale
+    For depth=1: y = Wx + (BA)x * scale  (standard LoRA)
+    For depth=N: y = Wx + sum_i(B_i @ A_i)x * scale  (stacked)
 
-    Initializes B=0 so LoRA starts as identity.
+    Stacking allows for deeper adaptation of critical layers.
     """
 
     def __init__(
         self,
         base: nn.Linear,
-        rank: int,
-        alpha: float,
-        dropout: float = 0.0,
+        spec: LoRALayerSpec,
     ):
         super().__init__()
 
         self.base = base
-        self.rank = rank
-        self.alpha = alpha
-        self.scale = alpha / rank
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.rank = spec.rank
+        self.alpha = spec.alpha
+        self.depth = spec.depth
+        self.scale = spec.alpha / spec.rank
+        self.lr_scale = spec.lr_scale
+
+        self.dropout = nn.Dropout(spec.dropout) if spec.dropout > 0 else nn.Identity()
 
         # Freeze base
         self.base.weight.requires_grad = False
         if self.base.bias is not None:
             self.base.bias.requires_grad = False
 
-        # Get device and dtype from base layer
         device = base.weight.device
         dtype = base.weight.dtype
 
-        # LoRA matrices - create on same device as base
-        self.lora_A = nn.Parameter(torch.zeros(rank, base.in_features, device=device, dtype=dtype))
-        self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, device=device, dtype=dtype))
+        # Stacked LoRA matrices
+        self.lora_A = nn.ParameterList([
+            nn.Parameter(torch.zeros(spec.rank, base.in_features, device=device, dtype=dtype))
+            for _ in range(spec.depth)
+        ])
+        self.lora_B = nn.ParameterList([
+            nn.Parameter(torch.zeros(base.out_features, spec.rank, device=device, dtype=dtype))
+            for _ in range(spec.depth)
+        ])
 
-        # Init A with kaiming, B with zeros
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        # B stays zero -> LoRA starts as identity
+        # Initialize: A with kaiming, B with zeros (starts as identity)
+        for A in self.lora_A:
+            nn.init.kaiming_uniform_(A, a=math.sqrt(5))
 
         self._merged = False
 
@@ -68,692 +95,508 @@ class LoRALinear(nn.Module):
         if self._merged:
             return base_out
 
-        # LoRA path: x @ A^T @ B^T * scale
-        # Cast to lora dtype for computation, then back to input dtype
-        x_lora = self.dropout(x).to(self.lora_A.dtype)
-        lora_out = x_lora @ self.lora_A.T @ self.lora_B.T
-        return base_out + lora_out.to(base_out.dtype) * self.scale
+        x_lora = self.dropout(x).to(self.lora_A[0].dtype)
+        lora_out = torch.zeros_like(base_out)
+
+        for A, B in zip(self.lora_A, self.lora_B):
+            lora_out = lora_out + (x_lora @ A.T @ B.T).to(base_out.dtype)
+
+        return base_out + lora_out * self.scale
 
     def merge(self):
         """Merge LoRA into base weights."""
         if not self._merged:
-            delta = (self.lora_B @ self.lora_A) * self.scale
-            self.base.weight.data += delta.to(self.base.weight.dtype)
+            for A, B in zip(self.lora_A, self.lora_B):
+                delta = (B @ A) * self.scale
+                self.base.weight.data += delta.to(self.base.weight.dtype)
             self._merged = True
 
     def unmerge(self):
         """Remove LoRA from base weights."""
         if self._merged:
-            delta = (self.lora_B @ self.lora_A) * self.scale
-            self.base.weight.data -= delta.to(self.base.weight.dtype)
+            for A, B in zip(self.lora_A, self.lora_B):
+                delta = (B @ A) * self.scale
+                self.base.weight.data -= delta.to(self.base.weight.dtype)
             self._merged = False
 
     @property
     def merged(self) -> bool:
         return self._merged
 
-
-# =============================================================================
-# Double-Stream LoRA (Prototype 1)
-# =============================================================================
-
-@dataclass
-class DoubleStreamLoRAConfig:
-    """Configuration for double-stream LoRA."""
-    rank: int = 16
-    alpha: float = 16.0
-    dropout: float = 0.0
-
-    # Which projections to adapt
-    adapt_txt_qkv: bool = True
-    adapt_img_qkv: bool = True
-    adapt_txt_out: bool = True
-    adapt_img_out: bool = True
-
-    # Which blocks (None = all 15)
-    block_indices: Optional[List[int]] = None
-
-
-class DoubleStreamLoRA(nn.Module):
-    """
-    LoRA for TinyFlux double-stream blocks.
-
-    Targets JointAttention projections where text↔image binding occurs:
-    - txt_qkv: text queries/keys/values
-    - img_qkv: image queries/keys/values
-    - txt_out: text output projection
-    - img_out: image output projection
-
-    Usage:
-        lora = DoubleStreamLoRA(model, rank=16)
-        optimizer = torch.optim.AdamW(lora.parameters(), lr=1e-4)
-        # ... train ...
-        lora.save("lora.safetensors")
-        lora.merge()  # Zero inference overhead
-    """
-
-    def __init__(
-        self,
-        model: nn.Module,
-        config: Optional[DoubleStreamLoRAConfig] = None,
-        rank: int = 16,
-        alpha: float = 16.0,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-
-        if config is None:
-            config = DoubleStreamLoRAConfig(rank=rank, alpha=alpha, dropout=dropout)
-        self.config = config
-
-        if not hasattr(model, 'double_blocks'):
-            raise ValueError("Model must have double_blocks attribute")
-
-        self.adapters: nn.ModuleDict = nn.ModuleDict()
-
-        num_blocks = len(model.double_blocks)
-        block_indices = config.block_indices or list(range(num_blocks))
-
-        # Inject LoRA into each target
-        for idx in block_indices:
-            if idx >= num_blocks:
-                continue
-
-            block = model.double_blocks[idx]
-            attn = block.attn  # JointAttention
-
-            targets = []
-            if config.adapt_txt_qkv:
-                targets.append(('txt_qkv', attn.txt_qkv))
-            if config.adapt_img_qkv:
-                targets.append(('img_qkv', attn.img_qkv))
-            if config.adapt_txt_out:
-                targets.append(('txt_out', attn.txt_out))
-            if config.adapt_img_out:
-                targets.append(('img_out', attn.img_out))
-
-            for name, layer in targets:
-                key = f"block_{idx}_{name}"
-                adapter = LoRALinear(
-                    layer,
-                    rank=config.rank,
-                    alpha=config.alpha,
-                    dropout=config.dropout,
-                )
-                self.adapters[key] = adapter
-                setattr(attn, name, adapter)
-
-        # Freeze entire model
-        for param in model.parameters():
-            param.requires_grad = False
-
-        # Unfreeze LoRA params
-        for adapter in self.adapters.values():
-            adapter.lora_A.requires_grad = True
-            adapter.lora_B.requires_grad = True
-
-        self._print_stats(model)
-
-    def _print_stats(self, model: nn.Module):
-        total = sum(p.numel() for p in model.parameters())
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        lora_params = sum(
-            a.lora_A.numel() + a.lora_B.numel()
-            for a in self.adapters.values()
-        )
-
-        print(f"\n[DoubleStreamLoRA]")
-        print(f"  Adapters: {len(self.adapters)}")
-        print(f"  Rank: {self.config.rank}, Alpha: {self.config.alpha}")
-        print(f"  LoRA params: {lora_params:,}")
-        print(f"  Trainable: {trainable:,} / {total:,} ({100*trainable/total:.3f}%)")
-
-    def parameters(self):
-        """Yield only LoRA parameters."""
-        for adapter in self.adapters.values():
-            yield adapter.lora_A
-            yield adapter.lora_B
-
-    def state_dict(self) -> Dict[str, torch.Tensor]:
-        """Get LoRA weights only."""
-        state = {}
-        for name, adapter in self.adapters.items():
-            state[f"{name}.lora_A"] = adapter.lora_A.data
-            state[f"{name}.lora_B"] = adapter.lora_B.data
-        return state
-
-    def load_state_dict(self, state: Dict[str, torch.Tensor]):
-        """Load LoRA weights."""
-        for name, adapter in self.adapters.items():
-            a_key = f"{name}.lora_A"
-            b_key = f"{name}.lora_B"
-            if a_key in state:
-                adapter.lora_A.data.copy_(state[a_key])
-            if b_key in state:
-                adapter.lora_B.data.copy_(state[b_key])
-
-    def save(self, path: str, metadata: Optional[Dict[str, str]] = None):
-        """Save LoRA weights."""
-        state = self.state_dict()
-
-        meta = metadata or {}
-        meta.update({
-            'type': 'double_stream_lora',
-            'rank': str(self.config.rank),
-            'alpha': str(self.config.alpha),
-            'num_adapters': str(len(self.adapters)),
-        })
-
-        if path.endswith('.safetensors'):
-            from safetensors.torch import save_file
-            save_file(state, path, metadata=meta)
-        else:
-            torch.save({'state_dict': state, 'metadata': meta}, path)
-
-        size_kb = sum(v.numel() * v.element_size() for v in state.values()) / 1024
-        print(f"Saved: {path} ({size_kb:.1f} KB, {len(state)} tensors)")
-
-    def load(self, path: str):
-        """Load LoRA weights."""
-        if path.endswith('.safetensors'):
-            from safetensors.torch import load_file
-            state = load_file(path)
-        else:
-            data = torch.load(path, map_location='cpu')
-            state = data.get('state_dict', data)
-
-        self.load_state_dict(state)
-        print(f"Loaded: {path}")
-
-    def merge(self):
-        """Merge all LoRA weights into base model."""
-        for adapter in self.adapters.values():
-            adapter.merge()
-        print(f"Merged {len(self.adapters)} adapters")
-
-    def unmerge(self):
-        """Unmerge all LoRA weights from base model."""
-        for adapter in self.adapters.values():
-            adapter.unmerge()
-        print(f"Unmerged {len(self.adapters)} adapters")
-
-    def set_scale(self, scale: float):
-        """Adjust LoRA contribution."""
-        for adapter in self.adapters.values():
-            adapter.scale = scale
-
-
-# =============================================================================
-# Single-Stream LoRA (Prototype 2)
-# =============================================================================
-
-@dataclass
-class SingleStreamLoRAConfig:
-    """Configuration for single-stream LoRA."""
-    rank: int = 16
-    alpha: float = 16.0
-    dropout: float = 0.0
-
-    # Which projections to adapt
-    adapt_qkv: bool = True      # Self-attention QKV
-    adapt_out: bool = True      # Self-attention output
-    adapt_mlp: bool = True      # MLP layers (fc1 + fc2)
-
-    # Which blocks (None = all 25)
-    block_indices: Optional[List[int]] = None
-
-
-class SingleStreamLoRA(nn.Module):
-    """
-    LoRA for TinyFlux single-stream blocks.
-
-    Targets unified self-attention where txt+img are concatenated:
-    - qkv: joint queries/keys/values
-    - out_proj: attention output projection
-    - mlp.fc1/fc2: feed-forward layers
-
-    Single-stream is where final refinement and detail generation happens.
-
-    Usage:
-        lora = SingleStreamLoRA(model, rank=16)
-        optimizer = torch.optim.AdamW(lora.parameters(), lr=1e-4)
-        # ... train ...
-        lora.save("lora.safetensors")
-        lora.merge()  # Zero inference overhead
-    """
-
-    def __init__(
-        self,
-        model: nn.Module,
-        config: Optional[SingleStreamLoRAConfig] = None,
-        rank: int = 16,
-        alpha: float = 16.0,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-
-        if config is None:
-            config = SingleStreamLoRAConfig(rank=rank, alpha=alpha, dropout=dropout)
-        self.config = config
-
-        if not hasattr(model, 'single_blocks'):
-            raise ValueError("Model must have single_blocks attribute")
-
-        self.adapters: nn.ModuleDict = nn.ModuleDict()
-
-        num_blocks = len(model.single_blocks)
-        block_indices = config.block_indices or list(range(num_blocks))
-
-        # Inject LoRA into each target
-        for idx in block_indices:
-            if idx >= num_blocks:
-                continue
-
-            block = model.single_blocks[idx]
-            attn = block.attn  # Attention (not JointAttention)
-            mlp = block.mlp   # MLP
-
-            # Attention targets
-            if config.adapt_qkv:
-                key = f"block_{idx}_qkv"
-                adapter = LoRALinear(
-                    attn.qkv,
-                    rank=config.rank,
-                    alpha=config.alpha,
-                    dropout=config.dropout,
-                )
-                self.adapters[key] = adapter
-                attn.qkv = adapter
-
-            if config.adapt_out:
-                key = f"block_{idx}_out"
-                adapter = LoRALinear(
-                    attn.out_proj,
-                    rank=config.rank,
-                    alpha=config.alpha,
-                    dropout=config.dropout,
-                )
-                self.adapters[key] = adapter
-                attn.out_proj = adapter
-
-            # MLP targets
-            if config.adapt_mlp:
-                key = f"block_{idx}_mlp_fc1"
-                adapter = LoRALinear(
-                    mlp.fc1,
-                    rank=config.rank,
-                    alpha=config.alpha,
-                    dropout=config.dropout,
-                )
-                self.adapters[key] = adapter
-                mlp.fc1 = adapter
-
-                key = f"block_{idx}_mlp_fc2"
-                adapter = LoRALinear(
-                    mlp.fc2,
-                    rank=config.rank,
-                    alpha=config.alpha,
-                    dropout=config.dropout,
-                )
-                self.adapters[key] = adapter
-                mlp.fc2 = adapter
-
-        # Freeze entire model
-        for param in model.parameters():
-            param.requires_grad = False
-
-        # Unfreeze LoRA params
-        for adapter in self.adapters.values():
-            adapter.lora_A.requires_grad = True
-            adapter.lora_B.requires_grad = True
-
-        self._print_stats(model)
-
-    def _print_stats(self, model: nn.Module):
-        total = sum(p.numel() for p in model.parameters())
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        lora_params = sum(
-            a.lora_A.numel() + a.lora_B.numel()
-            for a in self.adapters.values()
-        )
-
-        print(f"\n[SingleStreamLoRA]")
-        print(f"  Adapters: {len(self.adapters)}")
-        print(f"  Rank: {self.config.rank}, Alpha: {self.config.alpha}")
-        print(f"  LoRA params: {lora_params:,}")
-        print(f"  Trainable: {trainable:,} / {total:,} ({100*trainable/total:.3f}%)")
-
-    def parameters(self):
-        """Yield only LoRA parameters."""
-        for adapter in self.adapters.values():
-            yield adapter.lora_A
-            yield adapter.lora_B
-
-    def state_dict(self) -> Dict[str, torch.Tensor]:
-        """Get LoRA weights only."""
-        state = {}
-        for name, adapter in self.adapters.items():
-            state[f"{name}.lora_A"] = adapter.lora_A.data
-            state[f"{name}.lora_B"] = adapter.lora_B.data
-        return state
-
-    def load_state_dict(self, state: Dict[str, torch.Tensor]):
-        """Load LoRA weights."""
-        for name, adapter in self.adapters.items():
-            a_key = f"{name}.lora_A"
-            b_key = f"{name}.lora_B"
-            if a_key in state:
-                adapter.lora_A.data.copy_(state[a_key])
-            if b_key in state:
-                adapter.lora_B.data.copy_(state[b_key])
-
-    def save(self, path: str, metadata: Optional[Dict[str, str]] = None):
-        """Save LoRA weights."""
-        state = self.state_dict()
-
-        meta = metadata or {}
-        meta.update({
-            'type': 'single_stream_lora',
-            'rank': str(self.config.rank),
-            'alpha': str(self.config.alpha),
-            'num_adapters': str(len(self.adapters)),
-        })
-
-        if path.endswith('.safetensors'):
-            from safetensors.torch import save_file
-            save_file(state, path, metadata=meta)
-        else:
-            torch.save({'state_dict': state, 'metadata': meta}, path)
-
-        size_kb = sum(v.numel() * v.element_size() for v in state.values()) / 1024
-        print(f"Saved: {path} ({size_kb:.1f} KB, {len(state)} tensors)")
-
-    def load(self, path: str):
-        """Load LoRA weights."""
-        if path.endswith('.safetensors'):
-            from safetensors.torch import load_file
-            state = load_file(path)
-        else:
-            data = torch.load(path, map_location='cpu')
-            state = data.get('state_dict', data)
-
-        self.load_state_dict(state)
-        print(f"Loaded: {path}")
-
-    def merge(self):
-        """Merge all LoRA weights into base model."""
-        for adapter in self.adapters.values():
-            adapter.merge()
-        print(f"Merged {len(self.adapters)} adapters")
-
-    def unmerge(self):
-        """Unmerge all LoRA weights from base model."""
-        for adapter in self.adapters.values():
-            adapter.unmerge()
-        print(f"Unmerged {len(self.adapters)} adapters")
-
-    def set_scale(self, scale: float):
-        """Adjust LoRA contribution."""
-        for adapter in self.adapters.values():
-            adapter.scale = scale
-
-
-# =============================================================================
-# Combined LoRA (Double + Single)
-# =============================================================================
-
-@dataclass
-class CombinedLoRAConfig:
-    """Configuration for combined double+single stream LoRA."""
-    rank: int = 16
-    alpha: float = 16.0
-    dropout: float = 0.0
-
-    # Double-stream
-    adapt_double: bool = True
-    double_block_indices: Optional[List[int]] = None
-
-    # Single-stream
-    adapt_single: bool = True
-    single_block_indices: Optional[List[int]] = None
-    adapt_mlp: bool = True  # Include MLP in single-stream
-
-
-class CombinedLoRA(nn.Module):
-    """
-    Combined LoRA for both double-stream and single-stream blocks.
-
-    This is the full LoRA covering:
-    - Double-stream: txt↔img cross-attention (concept binding)
-    - Single-stream: unified self-attention + MLP (refinement)
-    """
-
-    def __init__(
-        self,
-        model: nn.Module,
-        config: Optional[CombinedLoRAConfig] = None,
-        rank: int = 16,
-        alpha: float = 16.0,
-    ):
-        super().__init__()
-
-        if config is None:
-            config = CombinedLoRAConfig(rank=rank, alpha=alpha)
-        self.config = config
-
-        self.double_lora = None
-        self.single_lora = None
-
-        if config.adapt_double:
-            double_config = DoubleStreamLoRAConfig(
-                rank=config.rank,
-                alpha=config.alpha,
-                dropout=config.dropout,
-                block_indices=config.double_block_indices,
-            )
-            self.double_lora = DoubleStreamLoRA(model, config=double_config)
-
-        if config.adapt_single:
-            single_config = SingleStreamLoRAConfig(
-                rank=config.rank,
-                alpha=config.alpha,
-                dropout=config.dropout,
-                adapt_mlp=config.adapt_mlp,
-                block_indices=config.single_block_indices,
-            )
-            self.single_lora = SingleStreamLoRA(model, config=single_config)
-
-        self._print_combined_stats(model)
-
-    def _print_combined_stats(self, model: nn.Module):
-        total = sum(p.numel() for p in model.parameters())
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-        print(f"\n[CombinedLoRA]")
-        print(f"  Total trainable: {trainable:,} / {total:,} ({100*trainable/total:.3f}%)")
-
-    def parameters(self):
+    @property
+    def num_params(self) -> int:
+        return sum(A.numel() + B.numel() for A, B in zip(self.lora_A, self.lora_B))
+
+    def get_lora_params(self) -> Iterator[nn.Parameter]:
         """Yield all LoRA parameters."""
-        if self.double_lora:
-            yield from self.double_lora.parameters()
-        if self.single_lora:
-            yield from self.single_lora.parameters()
+        for A in self.lora_A:
+            yield A
+        for B in self.lora_B:
+            yield B
+
+
+# =============================================================================
+# Main TinyFluxLoRA
+# =============================================================================
+
+class TinyFluxLoRA(nn.Module):
+    """
+    Flexible LoRA for TinyFlux with per-layer configuration.
+
+    Features:
+    - Per-layer rank, alpha, learning rate
+    - Stacked LoRA for deeper adaptation
+    - Block extensions (new trainable blocks)
+    - Config serialization for reproducibility
+
+    Examples:
+        # From preset
+        lora = TinyFluxLoRA.from_preset(model, "character")
+
+        # Custom config
+        config = TinyFluxLoRAConfig(
+            defaults=LoRADefaults(rank=16),
+            targets=[
+                LoRATarget("single_blocks.[20-24].*", rank=32, lr_scale=2.0),
+            ],
+        )
+        lora = TinyFluxLoRA(model, config)
+
+        # Quick usage
+        lora = TinyFluxLoRA(model, rank=32, include_single_mlp=False)
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        config: Optional[TinyFluxLoRAConfig] = None,
+        # Quick config options (used if config is None)
+        rank: int = 16,
+        alpha: Optional[float] = None,
+        include_double_attn: bool = False,
+        include_single_attn: bool = True,
+        include_single_mlp: bool = True,
+    ):
+        super().__init__()
+
+        # Build config if not provided
+        if config is None:
+            config = TinyFluxLoRAConfig(
+                defaults=LoRADefaults(rank=rank, alpha=alpha or float(rank)),
+                include_double_attn=include_double_attn,
+                include_single_attn=include_single_attn,
+                include_single_mlp=include_single_mlp,
+            )
+
+        self.config = config
+        self._model = model
+
+        # Get model dimensions
+        self._num_double = len(model.double_blocks) if hasattr(model, 'double_blocks') else 0
+        self._num_single = len(model.single_blocks) if hasattr(model, 'single_blocks') else 0
+
+        # Storage
+        self.adapters: nn.ModuleDict = nn.ModuleDict()
+        self._layer_paths: Dict[str, str] = {}  # safe_key -> original_path
+        self._layer_specs: Dict[str, LoRALayerSpec] = {}
+
+        # Extension blocks
+        self._extra_double_blocks: nn.ModuleList = nn.ModuleList()
+        self._extra_single_blocks: nn.ModuleList = nn.ModuleList()
+
+        # Inject adapters
+        self._inject_adapters(model)
+
+        # Setup extensions if configured
+        if config.extensions:
+            self._setup_extensions(model)
+
+        # Freeze base, unfreeze LoRA
+        self._setup_requires_grad(model)
+
+        # Print summary
+        self._print_summary()
+
+    @classmethod
+    def from_preset(
+        cls,
+        model: nn.Module,
+        preset: str,
+        **kwargs,
+    ) -> 'TinyFluxLoRA':
+        """Create LoRA from a preset configuration."""
+        config = TinyFluxLoRAConfig.from_preset(preset, **kwargs)
+        return cls(model, config)
+
+    @classmethod
+    def from_config_file(
+        cls,
+        model: nn.Module,
+        path: str,
+    ) -> 'TinyFluxLoRA':
+        """Create LoRA from a JSON config file."""
+        config = TinyFluxLoRAConfig.load(path)
+        return cls(model, config)
+
+    def _inject_adapters(self, model: nn.Module):
+        """Inject LoRA adapters into model layers."""
+        active = self.config.get_active_layers(self._num_double, self._num_single)
+
+        for path, spec in active.items():
+            try:
+                # Get the original layer
+                layer = resolve_layer(model, path)
+
+                if not isinstance(layer, nn.Linear):
+                    print(f"Warning: {path} is not Linear, skipping")
+                    continue
+
+                # Create adapter
+                adapter = StackedLoRALinear(layer, spec)
+
+                # Register with safe key
+                safe_key = path.replace('.', '_')
+                self.adapters[safe_key] = adapter
+                self._layer_paths[safe_key] = path
+                self._layer_specs[path] = spec
+
+                # Inject into model
+                set_layer(model, path, adapter)
+
+            except Exception as e:
+                print(f"Warning: Failed to inject {path}: {e}")
+
+    def _setup_extensions(self, model: nn.Module):
+        """Setup block extensions."""
+        ext = self.config.extensions
+        if not ext:
+            return
+
+        # Import block classes
+        from .model import DoubleStreamBlock, SingleStreamBlock, TinyFluxConfig
+
+        model_config = model.config if hasattr(model, 'config') else TinyFluxConfig()
+
+        # Extra double blocks
+        for i in range(ext.double_blocks):
+            block = DoubleStreamBlock(model_config)
+            if ext.double_init == "last" and self._num_double > 0:
+                block.load_state_dict(model.double_blocks[-1].state_dict())
+            self._extra_double_blocks.append(block)
+
+        # Extra single blocks
+        for i in range(ext.single_blocks):
+            block = SingleStreamBlock(model_config)
+            if ext.single_init == "last" and self._num_single > 0:
+                block.load_state_dict(model.single_blocks[-1].state_dict())
+            self._extra_single_blocks.append(block)
+
+    def _setup_requires_grad(self, model: nn.Module):
+        """Freeze base model, unfreeze LoRA and extensions."""
+        # Freeze all
+        for param in model.parameters():
+            param.requires_grad = False
+
+        # Unfreeze LoRA
+        for adapter in self.adapters.values():
+            for param in adapter.get_lora_params():
+                param.requires_grad = True
+
+        # Unfreeze extensions
+        for block in self._extra_double_blocks:
+            for param in block.parameters():
+                param.requires_grad = True
+        for block in self._extra_single_blocks:
+            for param in block.parameters():
+                param.requires_grad = True
+
+    def _print_summary(self):
+        """Print LoRA summary."""
+        lora_params = sum(a.num_params for a in self.adapters.values())
+        ext_params = sum(p.numel() for p in self._extra_double_blocks.parameters())
+        ext_params += sum(p.numel() for p in self._extra_single_blocks.parameters())
+
+        double_count = sum(1 for p in self._layer_paths.values() if 'double' in p)
+        single_count = len(self.adapters) - double_count
+
+        depths = set(s.depth for s in self._layer_specs.values())
+        lr_scales = set(s.lr_scale for s in self._layer_specs.values())
+
+        print(f"\n[TinyFluxLoRA] {self.config.name}")
+        print(f"  Adapters: {len(self.adapters)} (double: {double_count}, single: {single_count})")
+
+        if len(depths) > 1 or 1 not in depths:
+            print(f"  Depths: {sorted(depths)}")
+        if len(lr_scales) > 1:
+            print(f"  LR scales: {sorted(lr_scales)}")
+
+        print(f"  LoRA params: {lora_params:,}")
+
+        if ext_params > 0:
+            print(f"  Extension params: {ext_params:,}")
+            print(f"    Extra double: {len(self._extra_double_blocks)}")
+            print(f"    Extra single: {len(self._extra_single_blocks)}")
+
+        total = lora_params + ext_params
+        print(f"  Total trainable: {total:,} ({total * 4 / 1024 / 1024:.2f} MB)")
+
+    # =========================================================================
+    # Parameter Access
+    # =========================================================================
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        """Yield all trainable parameters."""
+        for adapter in self.adapters.values():
+            yield from adapter.get_lora_params()
+
+        for block in self._extra_double_blocks:
+            yield from block.parameters()
+        for block in self._extra_single_blocks:
+            yield from block.parameters()
+
+    def get_param_groups(self, base_lr: float) -> List[Dict[str, Any]]:
+        """
+        Get optimizer param groups with per-layer learning rates.
+
+        Usage:
+            groups = lora.get_param_groups(base_lr=1e-4)
+            optimizer = torch.optim.AdamW(groups)
+        """
+        lr_groups = self.config.get_lr_groups(base_lr, self._num_double, self._num_single)
+
+        param_groups = []
+        for effective_lr, paths in lr_groups.items():
+            params = []
+            for path in paths:
+                safe_key = path.replace('.', '_')
+                if safe_key in self.adapters:
+                    params.extend(self.adapters[safe_key].get_lora_params())
+
+            if params:
+                param_groups.append({
+                    'params': list(params),
+                    'lr': effective_lr,
+                    'name': f'lr_{effective_lr:.2e}',
+                })
+
+        # Extensions at base LR
+        ext_params = list(self._extra_double_blocks.parameters()) + \
+                     list(self._extra_single_blocks.parameters())
+        if ext_params:
+            param_groups.append({
+                'params': ext_params,
+                'lr': base_lr,
+                'name': 'extensions',
+            })
+
+        return param_groups
+
+    # =========================================================================
+    # State Dict
+    # =========================================================================
 
     def state_dict(self) -> Dict[str, torch.Tensor]:
-        """Get all LoRA weights."""
+        """Get LoRA weights."""
         state = {}
-        if self.double_lora:
-            for k, v in self.double_lora.state_dict().items():
-                state[f"double.{k}"] = v
-        if self.single_lora:
-            for k, v in self.single_lora.state_dict().items():
-                state[f"single.{k}"] = v
+
+        for key, adapter in self.adapters.items():
+            for i, (A, B) in enumerate(zip(adapter.lora_A, adapter.lora_B)):
+                if adapter.depth == 1:
+                    state[f"{key}.lora_A"] = A.data
+                    state[f"{key}.lora_B"] = B.data
+                else:
+                    state[f"{key}.lora_A.{i}"] = A.data
+                    state[f"{key}.lora_B.{i}"] = B.data
+
+        # Extensions
+        for i, block in enumerate(self._extra_double_blocks):
+            for k, v in block.state_dict().items():
+                state[f"ext_double_{i}.{k}"] = v
+        for i, block in enumerate(self._extra_single_blocks):
+            for k, v in block.state_dict().items():
+                state[f"ext_single_{i}.{k}"] = v
+
         return state
 
-    def load_state_dict(self, state: Dict[str, torch.Tensor]):
-        """Load all LoRA weights."""
-        double_state = {k[7:]: v for k, v in state.items() if k.startswith("double.")}
-        single_state = {k[7:]: v for k, v in state.items() if k.startswith("single.")}
+    def load_state_dict(self, state: Dict[str, torch.Tensor], strict: bool = True):
+        """Load LoRA weights."""
+        for key, adapter in self.adapters.items():
+            for i, (A, B) in enumerate(zip(adapter.lora_A, adapter.lora_B)):
+                if adapter.depth == 1:
+                    a_key, b_key = f"{key}.lora_A", f"{key}.lora_B"
+                else:
+                    a_key, b_key = f"{key}.lora_A.{i}", f"{key}.lora_B.{i}"
 
-        if self.double_lora and double_state:
-            self.double_lora.load_state_dict(double_state)
-        if self.single_lora and single_state:
-            self.single_lora.load_state_dict(single_state)
+                if a_key in state:
+                    A.data.copy_(state[a_key])
+                elif strict:
+                    raise KeyError(f"Missing: {a_key}")
+
+                if b_key in state:
+                    B.data.copy_(state[b_key])
+                elif strict:
+                    raise KeyError(f"Missing: {b_key}")
+
+        # Extensions
+        for i, block in enumerate(self._extra_double_blocks):
+            prefix = f"ext_double_{i}."
+            block_state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+            if block_state:
+                block.load_state_dict(block_state, strict=strict)
+
+        for i, block in enumerate(self._extra_single_blocks):
+            prefix = f"ext_single_{i}."
+            block_state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+            if block_state:
+                block.load_state_dict(block_state, strict=strict)
+
+    # =========================================================================
+    # Save / Load
+    # =========================================================================
 
     def save(self, path: str, metadata: Optional[Dict[str, str]] = None):
-        """Save all LoRA weights."""
+        """Save LoRA weights and config."""
         state = self.state_dict()
 
         meta = metadata or {}
-        meta.update({
-            'type': 'combined_lora',
-            'rank': str(self.config.rank),
-            'alpha': str(self.config.alpha),
-            'has_double': str(self.double_lora is not None),
-            'has_single': str(self.single_lora is not None),
-        })
+        meta['config_json'] = self.config.to_json()
+        meta['num_adapters'] = str(len(self.adapters))
 
         if path.endswith('.safetensors'):
             from safetensors.torch import save_file
             save_file(state, path, metadata=meta)
         else:
-            torch.save({'state_dict': state, 'metadata': meta}, path)
+            torch.save({
+                'state_dict': state,
+                'config': self.config.to_dict(),
+                'metadata': meta,
+            }, path)
 
         size_kb = sum(v.numel() * v.element_size() for v in state.values()) / 1024
-        print(f"Saved: {path} ({size_kb:.1f} KB, {len(state)} tensors)")
+        print(f"Saved: {path} ({size_kb:.1f} KB)")
 
-    def load(self, path: str):
-        """Load all LoRA weights."""
+    def load(self, path: str, strict: bool = True):
+        """Load LoRA weights."""
         if path.endswith('.safetensors'):
             from safetensors.torch import load_file
             state = load_file(path)
         else:
-            data = torch.load(path, map_location='cpu')
+            data = torch.load(path, map_location='cpu', weights_only=False)
             state = data.get('state_dict', data)
 
-        self.load_state_dict(state)
+        self.load_state_dict(state, strict=strict)
         print(f"Loaded: {path}")
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        model: nn.Module,
+        path: str,
+        strict: bool = True,
+    ) -> 'TinyFluxLoRA':
+        """Load LoRA with config from file."""
+        if path.endswith('.safetensors'):
+            from safetensors import safe_open
+            with safe_open(path, framework='pt') as f:
+                meta = f.metadata()
+            config = TinyFluxLoRAConfig.from_json(meta.get('config_json', '{}'))
+        else:
+            data = torch.load(path, map_location='cpu', weights_only=False)
+            config = TinyFluxLoRAConfig.from_dict(data.get('config', {}))
+
+        lora = cls(model, config)
+        lora.load(path, strict=strict)
+        return lora
+
+    # =========================================================================
+    # Merge / Unmerge
+    # =========================================================================
+
     def merge(self):
-        """Merge all LoRA weights into base model."""
-        if self.double_lora:
-            self.double_lora.merge()
-        if self.single_lora:
-            self.single_lora.merge()
+        """Merge LoRA weights into base model."""
+        for adapter in self.adapters.values():
+            adapter.merge()
+        print(f"Merged {len(self.adapters)} adapters")
 
     def unmerge(self):
-        """Unmerge all LoRA weights from base model."""
-        if self.double_lora:
-            self.double_lora.unmerge()
-        if self.single_lora:
-            self.single_lora.unmerge()
+        """Unmerge LoRA weights from base model."""
+        for adapter in self.adapters.values():
+            adapter.unmerge()
+        print(f"Unmerged {len(self.adapters)} adapters")
 
     def set_scale(self, scale: float):
-        """Adjust LoRA contribution."""
-        if self.double_lora:
-            self.double_lora.set_scale(scale)
-        if self.single_lora:
-            self.single_lora.set_scale(scale)
+        """Adjust LoRA strength."""
+        for adapter in self.adapters.values():
+            adapter.scale = scale
+
+    @property
+    def is_merged(self) -> bool:
+        return any(a.merged for a in self.adapters.values())
+
+    # =========================================================================
+    # Extension Block Runners
+    # =========================================================================
+
+    def run_extra_double_blocks(
+        self,
+        txt: torch.Tensor,
+        img: torch.Tensor,
+        vec: torch.Tensor,
+        rope: torch.Tensor,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run extra double blocks."""
+        for block in self._extra_double_blocks:
+            txt, img = block(txt, img, vec, rope, **kwargs)
+        return txt, img
+
+    def run_extra_single_blocks(
+        self,
+        txt: torch.Tensor,
+        img: torch.Tensor,
+        vec: torch.Tensor,
+        rope: torch.Tensor,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run extra single blocks."""
+        for block in self._extra_single_blocks:
+            txt, img = block(txt, img, vec, rope, **kwargs)
+        return txt, img
 
 
 # =============================================================================
-# Utility Functions
+# Legacy Compatibility
 # =============================================================================
 
-def calculate_double_lora_size(
-    hidden_size: int = 512,
-    num_heads: int = 4,
-    head_dim: int = 128,
-    num_blocks: int = 15,
-    rank: int = 16,
-) -> Dict[str, int]:
-    """Calculate LoRA parameter count for double-stream."""
-    qkv_in = hidden_size
-    qkv_out = 3 * num_heads * head_dim  # 1536
-    out_in = num_heads * head_dim        # 512
-    out_out = hidden_size                # 512
-
-    # LoRA params per layer: rank * (in + out)
-    txt_qkv_lora = rank * (qkv_in + qkv_out)
-    img_qkv_lora = rank * (qkv_in + qkv_out)
-    txt_out_lora = rank * (out_in + out_out)
-    img_out_lora = rank * (out_in + out_out)
-
-    per_block = txt_qkv_lora + img_qkv_lora + txt_out_lora + img_out_lora
-    total = per_block * num_blocks
-
-    return {
-        'per_qkv': txt_qkv_lora,
-        'per_out': txt_out_lora,
-        'per_block': per_block,
-        'total': total,
-        'total_kb': total * 4 / 1024,
-        'total_mb': total * 4 / 1024 / 1024,
-    }
-
-
-def calculate_single_lora_size(
-    hidden_size: int = 512,
-    num_heads: int = 4,
-    head_dim: int = 128,
-    mlp_ratio: float = 4.0,
-    num_blocks: int = 25,
-    rank: int = 16,
-    include_mlp: bool = True,
-) -> Dict[str, int]:
-    """Calculate LoRA parameter count for single-stream."""
-    # Attention
-    qkv_in = hidden_size
-    qkv_out = 3 * num_heads * head_dim  # 1536
-    out_in = num_heads * head_dim        # 512
-    out_out = hidden_size                # 512
-
-    qkv_lora = rank * (qkv_in + qkv_out)
-    out_lora = rank * (out_in + out_out)
-
-    # MLP
-    mlp_hidden = int(hidden_size * mlp_ratio)
-    fc1_lora = rank * (hidden_size + mlp_hidden) if include_mlp else 0
-    fc2_lora = rank * (mlp_hidden + hidden_size) if include_mlp else 0
-
-    per_block = qkv_lora + out_lora + fc1_lora + fc2_lora
-    total = per_block * num_blocks
-
-    return {
-        'per_qkv': qkv_lora,
-        'per_out': out_lora,
-        'per_mlp': fc1_lora + fc2_lora,
-        'per_block': per_block,
-        'total': total,
-        'total_kb': total * 4 / 1024,
-        'total_mb': total * 4 / 1024 / 1024,
-    }
-
-
-def calculate_combined_lora_size(
-    hidden_size: int = 512,
-    num_heads: int = 4,
-    head_dim: int = 128,
-    mlp_ratio: float = 4.0,
-    num_double_blocks: int = 15,
-    num_single_blocks: int = 25,
-    rank: int = 16,
-    include_mlp: bool = True,
-) -> Dict[str, int]:
-    """Calculate LoRA parameter count for combined double+single."""
-    double = calculate_double_lora_size(
-        hidden_size, num_heads, head_dim, num_double_blocks, rank
-    )
-    single = calculate_single_lora_size(
-        hidden_size, num_heads, head_dim, mlp_ratio, num_single_blocks, rank, include_mlp
+def DoubleStreamLoRA(model, rank=16, **kwargs):
+    """Legacy: Double-stream only."""
+    return TinyFluxLoRA(
+        model,
+        rank=rank,
+        include_double_attn=True,
+        include_single_attn=False,
+        include_single_mlp=False,
+        **kwargs,
     )
 
-    total = double['total'] + single['total']
+def SingleStreamLoRA(model, rank=16, **kwargs):
+    """Legacy: Single-stream only."""
+    return TinyFluxLoRA(
+        model,
+        rank=rank,
+        include_double_attn=False,
+        include_single_attn=True,
+        include_single_mlp=True,
+        **kwargs,
+    )
 
-    return {
-        'double_total': double['total'],
-        'single_total': single['total'],
-        'total': total,
-        'total_kb': total * 4 / 1024,
-        'total_mb': total * 4 / 1024 / 1024,
-    }
+def CombinedLoRA(model, rank=16, **kwargs):
+    """Legacy: Combined."""
+    return TinyFluxLoRA(
+        model,
+        rank=rank,
+        include_double_attn=True,
+        include_single_attn=True,
+        include_single_mlp=True,
+        **kwargs,
+    )
