@@ -280,6 +280,7 @@ class ModelZoo:
         filename: str = "sd15-flow-lune-unet.safetensors",
         dtype: Optional[torch.dtype] = None,
         compile_model: bool = False,
+        compile_mode: str = "reduce-overhead",
     ) -> nn.Module:
         """
         Load Lune (SD1.5 UNet with flow-matching weights).
@@ -325,7 +326,7 @@ class ModelZoo:
         self._lune_hook_handle = unet.mid_block.register_forward_hook(hook_fn)
 
         if compile_model:
-            unet = torch.compile(unet, mode="reduce-overhead")
+            unet = torch.compile(unet, mode=compile_mode)
 
         self._models["lune"] = unet
         self._offloaded["lune"] = False
@@ -341,7 +342,8 @@ class ModelZoo:
         repo_id: str = "AbstractPhil/tinyflux-experts",
         filename: str = "sd15-flow-sol-unet.safetensors",
         dtype: Optional[torch.dtype] = None,
-        compile_model: bool = False,  # Recommended for faster extraction
+        compile_model: bool = False,  # Recommended for faster extraction on larger caches
+        compile_mode: str = "reduce-overhead",
     ) -> nn.Module:
         """
         Load Sol (SD1.5 UNet) for attention statistics extraction.
@@ -380,7 +382,7 @@ class ModelZoo:
         unet.set_attn_processor(processor)
 
         if compile_model:
-            unet = torch.compile(unet, mode="reduce-overhead")
+            unet = torch.compile(unet, mode=compile_mode)
 
         self._models["sol"] = unet
         self._offloaded["sol"] = False
